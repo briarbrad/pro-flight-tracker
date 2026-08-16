@@ -39,7 +39,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
+# NOTE: these are copied by name, so a new top-level module must be added here
+# or it silently won't exist in the image and the app dies on import.
 COPY app.py .
+COPY store.py .
 COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/

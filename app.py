@@ -28,6 +28,8 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+import store
+
 app = Flask(__name__)
 CORS(app)  # Allow Rork app to call from any origin
 
@@ -513,21 +515,11 @@ def check_flight():
     flight_num = flight[2:]
     swim_callsign = _iata_to_icao_airline(airline_prefix) + flight_num
 
-    # Build the parallel task list
+    # Tasks that don't depend on knowing origin/dest yet.
+    # NOTE: flight_status and equipment_chain used to be listed here too, but
+    # were sliced off by `tasks[2:]` below and run elsewhere — dead entries
+    # that would have silently come back to life on any reorder.
     tasks = [
-        # --- Flight Data ---
-        {
-            "key": "flight_status",
-            "script": "flight_data.py",
-            "args": ["status", "--flight", flight, "--date", date],
-            "timeout": 20
-        },
-        {
-            "key": "equipment_chain",
-            "script": "flight_data.py",
-            "args": ["chain", "--flight", flight, "--date", date],
-            "timeout": 30
-        },
         # --- Weather (origin + dest will be filled from flight_status,
         #     but we can do a broad pull) ---
         {
@@ -655,19 +647,30 @@ def check_flight():
                     "timeout": 20
                 })
 
-    # Also run equipment chain in parallel with phase 2
+    # Also run equipment chain in parallel with phase 2.
+    # Hand it the Phase 1 flight status so it doesn't re-buy /flights/{ident}
+    # from AeroAPI — that saves one query on every single check.
+    chain_env = None
+    if status_code == 200 and isinstance(status_data, dict):
+        if (status_data.get("data") or {}).get("flights"):
+            try:
+                chain_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
+            except (TypeError, ValueError):
+                chain_env = None
+
     phase2_tasks.append({
         "key": "equipment_chain",
         "script": "flight_data.py",
         "args": ["chain", "--flight", flight, "--date", date],
-        "timeout": 30
+        "timeout": 30,
+        "env_extras": chain_env,
     })
 
     # Run phase 2 in parallel
     phase2_results = run_scripts_parallel(phase2_tasks, max_workers=8)
 
-    # Also run the initial SWIM tasks in parallel
-    swim_results = run_scripts_parallel(tasks[2:], max_workers=4)
+    # Also run the airport-independent tasks in parallel
+    swim_results = run_scripts_parallel(tasks, max_workers=4)
 
     # Merge everything into a unified response
     response = {
@@ -697,10 +700,10 @@ def check_flight():
 # FLIGHT TRACKING — Background monitoring with push notifications
 # ============================================================================
 
-# In-memory store for tracked flights (for personal use, this is fine)
-# For persistence across deploys, swap to SQLite or Redis
-tracked_flights: dict[str, dict] = {}
-tracking_lock = threading.Lock()
+# Tracked flights live in `store` — Postgres when DATABASE_URL is set,
+# in-memory otherwise. See store.py. The old module-level dict was per-worker,
+# so with gunicorn --workers 2 a POST landed in one worker and the other never
+# saw it.
 
 
 @app.route("/api/track", methods=["POST"])
@@ -721,24 +724,23 @@ def start_tracking():
         return jsonify({"error": "Missing 'flight' and/or 'push_token'"}), 400
 
     date = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    interval = int(body.get("interval_minutes", 15))
-    track_id = f"{flight}_{date}"
 
-    with tracking_lock:
-        tracked_flights[track_id] = {
-            "flight": flight,
-            "date": date,
-            "push_token": push_token,
-            "interval_minutes": interval,
-            "last_check": None,
-            "last_risk": None,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+    # Guard the interval: below ~5 minutes the AeroAPI spend climbs fast and
+    # you risk the Personal tier's 10 result-sets/minute limit.
+    try:
+        interval = int(body.get("interval_minutes", 15))
+    except (TypeError, ValueError):
+        interval = 15
+    interval = max(5, min(240, interval))
+
+    track_id = f"{flight}_{date}"
+    record = store.add(track_id, flight, date, push_token, interval)
 
     return jsonify({
         "status": "tracking",
         "track_id": track_id,
         "interval_minutes": interval,
+        "expires_at": record.get("expires_at"),
         "message": f"Now tracking {flight} on {date}. "
                    f"You'll get a push notification if the risk level changes."
     })
@@ -751,21 +753,25 @@ def stop_tracking():
     date = request.args.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     track_id = f"{flight}_{date}"
 
-    with tracking_lock:
-        if track_id in tracked_flights:
-            del tracked_flights[track_id]
-            return jsonify({"status": "stopped", "track_id": track_id})
-        return jsonify({"error": "Not tracking this flight"}), 404
+    if store.remove(track_id):
+        return jsonify({"status": "stopped", "track_id": track_id})
+    return jsonify({"error": "Not tracking this flight"}), 404
 
 
 @app.route("/api/tracked")
 def list_tracked():
     """List all currently tracked flights."""
-    with tracking_lock:
-        return jsonify({
-            "tracked": list(tracked_flights.values()),
-            "count": len(tracked_flights)
-        })
+    tracked = store.list_all()
+    return jsonify({
+        "tracked": tracked,
+        "count": len(tracked),
+        "store_backend": store.backend_name(),
+        # True only if THIS worker holds the tracker lease. With >1 worker,
+        # most requests land on a standby and will report False even though
+        # the tracker is running fine elsewhere. Check the logs for
+        # "[TRACKER] Background flight tracker started" to confirm.
+        "tracker_on_this_worker": TRACKER_IS_LEADER,
+    })
 
 
 # ============================================================================
@@ -838,32 +844,65 @@ def extract_risk_level(check_data: dict) -> str:
     return risk
 
 
+def _flight_is_finished(status_data: dict) -> str | None:
+    """Return a reason string if the flight is over, else None.
+
+    Once a flight has arrived, been cancelled, or diverted, there is nothing
+    left to warn about — continuing to poll just spends AeroAPI credit.
+    """
+    if not isinstance(status_data, dict):
+        return None
+
+    flights = status_data.get("data", {}).get("flights") or status_data.get("flights")
+    if not flights:
+        return None
+
+    f = flights[0]
+    if not isinstance(f, dict):
+        return None
+
+    if f.get("cancelled"):
+        return "cancelled"
+    if f.get("diverted"):
+        return "diverted"
+    if f.get("actual_in"):
+        return "arrived at gate"
+    status = (f.get("status") or "").lower()
+    if "arrived" in status or "landed" in status:
+        return "arrived"
+    return None
+
+
 def background_tracker():
-    """Background thread that periodically checks tracked flights."""
+    """Background thread that periodically checks tracked flights.
+
+    Only ever runs in the single process that won leader election — see
+    store.acquire_leadership(). Two copies of this loop would double AeroAPI
+    spend for identical data.
+    """
     while True:
         time.sleep(60)  # Check every minute if any flights are due
 
         now = datetime.now(timezone.utc)
-        flights_to_check = []
 
-        with tracking_lock:
-            for track_id, info in tracked_flights.items():
-                last = info.get("last_check")
-                interval = info.get("interval_minutes", 15)
+        try:
+            dropped = store.purge_expired(now)
+            if dropped:
+                print(f"[TRACKER] Purged {dropped} expired flight(s)", file=sys.stderr)
+            flights_to_check = store.due_for_check(now)
+        except Exception as exc:
+            print(f"[TRACKER] Store error: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            continue
 
-                if last is None:
-                    flights_to_check.append((track_id, info.copy()))
-                else:
-                    last_dt = datetime.fromisoformat(last)
-                    if (now - last_dt) >= timedelta(minutes=interval):
-                        flights_to_check.append((track_id, info.copy()))
-
-        for track_id, info in flights_to_check:
+        for info in flights_to_check:
+            track_id = info.get("track_id", "?")
             try:
                 flight = info["flight"]
                 date = info["date"]
 
-                # Run a quick check (subset of sources for speed)
+                # Run a quick check (subset of sources for speed).
+                # flight_data.py status = 2 AeroAPI queries; SWIM is free.
                 quick_tasks = [
                     {
                         "key": "flight_status",
@@ -886,10 +925,16 @@ def background_tracker():
                 old_risk = info.get("last_risk")
 
                 # Update tracking state
-                with tracking_lock:
-                    if track_id in tracked_flights:
-                        tracked_flights[track_id]["last_check"] = now.isoformat()
-                        tracked_flights[track_id]["last_risk"] = new_risk
+                store.mark_checked(track_id, now, new_risk)
+
+                # Stop tracking once the flight is over.
+                finished = _flight_is_finished(
+                    results.get("flight_status", {}).get("data")
+                )
+                if finished:
+                    store.remove(track_id)
+                    print(f"[TRACKER] {flight} {finished} — untracked",
+                          file=sys.stderr)
 
                 # Send push notification if risk changed
                 if old_risk and new_risk != old_risk:
@@ -943,11 +988,42 @@ def _icao_to_faa(icao: str) -> str:
 # STARTUP
 # ============================================================================
 
-if __name__ == "__main__":
-    # Start background tracker thread
-    tracker_thread = threading.Thread(target=background_tracker, daemon=True)
-    tracker_thread.start()
-    print("[TRACKER] Background flight tracker started", file=sys.stderr)
+def start_background_tracker() -> bool:
+    """Start the tracker in exactly one process. Returns True if this is it.
 
+    This runs at IMPORT time, not under `if __name__ == "__main__"`. Gunicorn
+    imports this module as `app`, so anything gated on __main__ never executes
+    in production — which is why the tracker silently never ran.
+
+    Leader election keeps that fix from creating a worse problem: with
+    --workers 2, every worker would otherwise start its own tracker and bill
+    AeroAPI twice for identical data.
+    """
+    if os.environ.get("DISABLE_TRACKER", "").lower() in ("1", "true", "yes"):
+        print("[TRACKER] Disabled via DISABLE_TRACKER", file=sys.stderr)
+        return False
+
+    try:
+        store.init()
+    except Exception as exc:
+        print(f"[TRACKER] Store init failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    if not store.acquire_leadership():
+        print(f"[TRACKER] Standby (another worker holds the lease), "
+              f"pid={os.getpid()}", file=sys.stderr)
+        return False
+
+    thread = threading.Thread(target=background_tracker, daemon=True)
+    thread.start()
+    print(f"[TRACKER] Background flight tracker started "
+          f"(pid={os.getpid()}, store={store.backend_name()})", file=sys.stderr)
+    return True
+
+
+TRACKER_IS_LEADER = start_background_tracker()
+
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)

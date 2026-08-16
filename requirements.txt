@@ -15,5 +15,9 @@ lxml>=5.0
 # HTTP client (used by some scripts)
 requests>=2.31
 
+# Tracking store — used when DATABASE_URL is set (Railway Postgres).
+# Without it the app falls back to in-memory tracking automatically.
+psycopg[binary]>=3.2
+
 # Async support for lightning WebSocket
 aiohttp>=3.9
