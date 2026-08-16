@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # or it silently won't exist in the image and the app dies on import.
 COPY app.py .
 COPY store.py .
+COPY analysis.py .
 COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/

@@ -29,6 +29,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 import store
+import analysis
 
 app = Flask(__name__)
 CORS(app)  # Allow Rork app to call from any origin
@@ -866,6 +867,160 @@ def list_tracked():
         # "[TRACKER] Background flight tracker started" to confirm.
         "tracker_on_this_worker": TRACKER_IS_LEADER,
     })
+
+
+# ============================================================================
+# ANALYSIS BRIEF — horizon-gated, deterministic, LLM-ready
+# ============================================================================
+
+@app.route("/api/brief", methods=["GET", "POST"])
+def flight_brief():
+    """Horizon-aware analysis for one flight, plus a ready-to-send LLM prompt.
+
+    Unlike /api/check, this does NOT fan out to everything. It resolves how far
+    away the departure is, then consults only the sources that still carry
+    signal at that horizon. A flight 15 hours out doesn't pay for live surface
+    feeds or an equipment chain that isn't assigned yet — which makes this both
+    cheaper and more accurate than the aggregate endpoint.
+
+    Returns a deterministic verdict AND `llm_payload`, so the client can send
+    the synthesis step to whatever model it wants. All arithmetic is done here;
+    the model never computes anything.
+    """
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        flight = clean_ident(body.get("flight") or request.args.get("flight", ""))
+        date = body.get("date") or request.args.get("date")
+    else:
+        flight = clean_ident(request.args.get("flight", ""))
+        date = request.args.get("date")
+
+    if not flight:
+        return jsonify({"error": "Missing or invalid 'flight' parameter",
+                        "hint": "e.g. flight=DL244"}), 400
+    date = clean_param(date or datetime.now(timezone.utc).strftime("%Y-%m-%d"), 12)
+
+    aeroapi_queries = 0
+    sources = {}
+
+    # --- Step 1: flight status. Always needed; it's what dates the horizon.
+    status_data, status_code = run_script(
+        "flight_data.py", ["status", "--flight", flight, "--date", date],
+        timeout=20)
+    aeroapi_queries += 2
+
+    flights = _extract_flights(status_data) if status_code == 200 else []
+    if not flights:
+        return jsonify({
+            "flight": flight, "date": date,
+            "error": "No flight data available",
+            "detail": (status_data.get("errors") or status_data.get("error")
+                       if isinstance(status_data, dict) else None),
+            "hint": "Check the flight number and date. AeroAPI only carries "
+                    "roughly a 10-day forward window.",
+            "aeroapi_queries_used": aeroapi_queries,
+        }), 404
+
+    primary = flights[0]
+    sources["flight_status"] = {"status": "ok", "relevance": "PRIMARY",
+                                "data": primary}
+
+    # --- Step 2: horizon decides everything downstream.
+    horizon = analysis.compute_horizon(primary)
+    plan = analysis.source_plan(horizon["hours_to_departure"])
+
+    origin = primary.get("origin_icao")
+    dest = primary.get("dest_icao")
+    airports = [a for a in (origin, dest) if a]
+
+    # --- Step 3: fetch only what the horizon justifies.
+    tasks = []
+    if plan["taf"]["relevant"] and airports:
+        tasks.append({"key": "taf", "script": "aviation_weather.py",
+                      "args": ["taf", "--icao"] + airports, "timeout": 15})
+    if plan["faa_status"]["relevant"] and airports:
+        tasks.append({"key": "faa_status", "script": "aviation_weather.py",
+                      "args": ["faa-status", "--icao"] + airports, "timeout": 15})
+    if plan["metar"]["relevant"] and airports:
+        tasks.append({"key": "metar", "script": "aviation_weather.py",
+                      "args": ["metar", "--icao"] + airports, "timeout": 15})
+    if plan["sigmet"]["relevant"]:
+        tasks.append({"key": "sigmet", "script": "aviation_weather.py",
+                      "args": ["sigmet"], "timeout": 15})
+    if plan["gairmet"]["relevant"] and origin and dest:
+        tasks.append({"key": "gairmet", "script": "airport_ops.py",
+                      "args": ["gairmet", "--route", origin, dest], "timeout": 20})
+    if plan["tfms_flow"]["relevant"]:
+        tasks.append({"key": "tfms_flow", "script": "swim_consumer.py",
+                      "args": ["tfms-flow", "--keyword", "GDP", "--duration", "10"],
+                      "timeout": SWIM_TIMEOUT})
+    if plan["lightning"]["relevant"] and origin:
+        tasks.append({"key": "lightning", "script": "airport_ops.py",
+                      "args": ["lightning", "--icao", origin, "--duration", "5"],
+                      "timeout": 20})
+    if plan["rvr"]["relevant"] and origin:
+        tasks.append({"key": "rvr", "script": "airport_ops.py",
+                      "args": ["rvr", "--airport", to_faa(origin)], "timeout": 15})
+
+    if tasks:
+        for key, result in run_scripts_parallel(tasks, max_workers=6).items():
+            ok = result["status"] == 200
+            sources[key] = {
+                "status": "ok" if ok else "error",
+                "relevance": "RELEVANT",
+                "provides": plan.get(key, {}).get("provides"),
+                "data": result["data"] if ok else None,
+                "error": None if ok else result["data"],
+            }
+
+    # --- Step 4: equipment chain, only when it's actually knowable.
+    turn_analysis = {}
+    if plan["equipment_chain"]["relevant"]:
+        chain_env = None
+        if isinstance(status_data, dict):
+            try:
+                chain_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
+            except (TypeError, ValueError):
+                chain_env = None
+        chain_data, chain_code = run_script(
+            "flight_data.py", ["chain", "--flight", flight, "--date", date],
+            timeout=30, env_extras=chain_env)
+        aeroapi_queries += 2  # status is prefetched; inbound + position remain
+        if chain_code == 200 and isinstance(chain_data, dict):
+            inner = chain_data.get("data") or {}
+            turn_analysis = inner.get("turn_analysis") or {}
+            sources["equipment_chain"] = {"status": "ok", "relevance": "PRIMARY",
+                                          "provides": plan["equipment_chain"]["provides"],
+                                          "data": inner}
+        else:
+            sources["equipment_chain"] = {"status": "error", "relevance": "PRIMARY",
+                                          "error": chain_data}
+
+    # --- Step 5: deterministic analysis.
+    programs = analysis._programs_from_faa(
+        (sources.get("faa_status") or {}).get("data"))
+    branch = analysis.classify_branch(horizon, programs, turn_analysis, plan)
+    verdict = analysis.assess(horizon, branch, turn_analysis, primary)
+
+    excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
+
+    payload = analysis.build_llm_payload(flight, date, horizon, plan, branch,
+                                         verdict, sources)
+
+    return jsonify({
+        "flight": flight,
+        "date": date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "horizon": horizon,
+        "verdict": verdict,
+        "branch_classification": branch,
+        "sources_consulted": sorted(k for k, v in sources.items()
+                                    if v.get("status") == "ok"),
+        "sources_excluded": excluded,
+        "sources": sources,
+        "llm_payload": payload,
+        "aeroapi_queries_used": aeroapi_queries,
+    }), 200
 
 
 # ============================================================================
