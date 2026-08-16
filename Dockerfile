@@ -1,10 +1,5 @@
 # Pro Flight Tracker — Railway Dockerfile
 # Python 3.12 + Java 21 (for SWIM JMS client)
-#
-# We use Python 3.12 (widely supported) and Java 21 LTS.
-# The jumpstart JAR was compiled with Java 25, so we install
-# the latest OpenJDK available in the base image and fall back
-# to downloading if needed.
 
 FROM python:3.12-slim
 
@@ -14,15 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     curl \
     ca-certificates \
+    dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 # Install OpenJDK 21+ (required for SWIM jumpstart JAR)
-# The JAR needs Java 25 class files — install latest available
 RUN apt-get update && apt-get install -y --no-install-recommends \
     default-jdk \
     && rm -rf /var/lib/apt/lists/* \
     || ( \
-    # Fallback: download Eclipse Temurin JDK 21
     curl -sL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse" -o /tmp/jdk.tar.gz && \
     mkdir -p /usr/lib/jvm && \
     tar -xzf /tmp/jdk.tar.gz -C /usr/lib/jvm && \
@@ -47,7 +41,8 @@ COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/
 
-# Make swim/bin/run executable
+# Fix Windows/Mac line endings and make executable
+RUN find swim/ -type f -exec dos2unix {} \; 2>/dev/null || true
 RUN chmod +x swim/bin/run 2>/dev/null || true
 
 # Expose port (Railway sets PORT env var)
