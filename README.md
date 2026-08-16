@@ -1,5 +1,3 @@
-# pro-flight-tracker
-A pro flight tracker
 # ✈️ Pro Flight Tracker API
 
 A comprehensive flight delay risk assessment engine that pulls from **15+ real-time aviation data sources** including direct FAA SWIM feeds — the same data pipeline used by airlines and air traffic control.
