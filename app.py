@@ -1003,16 +1003,23 @@ def start_background_tracker() -> bool:
         print("[TRACKER] Disabled via DISABLE_TRACKER", file=sys.stderr)
         return False
 
+    # Leadership FIRST, schema init SECOND. `store.init()` runs
+    # `CREATE TABLE IF NOT EXISTS`, which is not actually safe against two
+    # sessions doing it at once on a table that's never existed — both see
+    # "doesn't exist" and race, and the loser can hit a UniqueViolation on
+    # Postgres's internal pg_type bookkeeping. Deciding the leader with the
+    # advisory lock BEFORE anyone touches schema means exactly one process,
+    # cluster-wide, ever runs init() — the race can't happen at all.
+    if not store.acquire_leadership():
+        print(f"[TRACKER] Standby (another worker holds the lease), "
+              f"pid={os.getpid()}", file=sys.stderr)
+        return False
+
     try:
         store.init()
     except Exception as exc:
         print(f"[TRACKER] Store init failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
-
-    if not store.acquire_leadership():
-        print(f"[TRACKER] Standby (another worker holds the lease), "
-              f"pid={os.getpid()}", file=sys.stderr)
-        return False
 
     thread = threading.Thread(target=background_tracker, daemon=True)
     thread.start()

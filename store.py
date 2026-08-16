@@ -121,13 +121,33 @@ _COLS = ("track_id, flight, flight_date, push_token, interval_minutes, "
 
 
 def init() -> None:
-    """Create the table if needed. Safe to call repeatedly."""
+    """Create the table if needed. Safe to call repeatedly.
+
+    app.py only calls this from the leader (see acquire_leadership()), which
+    is the real fix for the race below. This except clause is a second,
+    independent safety net in case init() is ever called from somewhere that
+    doesn't go through leader election.
+
+    CREATE TABLE IF NOT EXISTS is not actually atomic across two concurrent
+    sessions the first time a table is created: both can see "doesn't exist"
+    and race to create it, and the loser gets a UniqueViolation on Postgres's
+    own internal pg_type bookkeeping (error mentions
+    pg_type_typname_nsp_index) rather than a clean "already exists". That
+    failure means the table now exists — precisely what IF NOT EXISTS was
+    supposed to guarantee — so it's swallowed as a success rather than
+    propagated as a startup failure.
+    """
     if not using_postgres():
         return
-    with _psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(SCHEMA)
-        conn.commit()
+    try:
+        with _psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA)
+            conn.commit()
+    except Exception as exc:
+        if "pg_type_typname_nsp_index" in str(exc):
+            return  # benign: a concurrent session just finished creating it
+        raise
 
 
 # ---------------------------------------------------------------------------
