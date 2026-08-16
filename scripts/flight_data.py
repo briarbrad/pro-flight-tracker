@@ -38,15 +38,20 @@ OPENSKY_BASE = "https://opensky-network.org/api"
 REQUEST_TIMEOUT = 10
 RETRY_BACKOFF = 1
 
+# Matched by PREFIX FAMILY, not exact type. AeroAPI reports subtypes
+# (A333, B763, B77W, B78X) that don't contain their parent string — the old
+# exact list classified every real widebody as narrowbody, so e.g. an A330's
+# turn was judged against a 90-min standard instead of 150.
 TURN_TIME_BENCHMARKS = {
     "regional":   {"min": 45, "standard": 60,
-                   "types": ["E170","E175","E145","CRJ","ERJ"]},
-    "narrowbody": {"min": 60, "standard": 90,
-                   "types": ["A319","A320","A321","B737","B738","B739",
-                             "B38M","B39M","A20N","A21N"]},
+                   "types": ["E17", "E19", "E14", "E75", "CRJ", "ERJ",
+                             "DH8", "AT7", "AT4", "SF3"]},
     "widebody":   {"min": 90, "standard": 150,
-                   "types": ["A330","A340","A350","A380","B747","B767",
-                             "B777","B787","B788","B789"]},
+                   "types": ["A33", "A34", "A35", "A38", "B74", "B76",
+                             "B77", "B78", "MD11", "IL9"]},
+    "narrowbody": {"min": 60, "standard": 90,
+                   "types": ["A19N", "A20N", "A21N", "A31", "A32", "B73",
+                             "B38M", "B39M", "B75", "MD8", "MD9", "B72"]},
 }
 
 # ---------------------------------------------------------------------------
