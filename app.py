@@ -879,9 +879,18 @@ def background_tracker():
     Only ever runs in the single process that won leader election — see
     store.acquire_leadership(). Two copies of this loop would double AeroAPI
     spend for identical data.
+
+    Runs a check immediately on entry, then every 60s after. Running
+    immediately matters most for the retry path in _watch_for_leadership():
+    when a worker finally wins the lock minutes after boot, anything that
+    was already due (e.g. last_check was never set) shouldn't have to wait a
+    further 60s on top of however long the retry took.
     """
+    first_pass = True
     while True:
-        time.sleep(60)  # Check every minute if any flights are due
+        if not first_pass:
+            time.sleep(60)  # Check every minute if any flights are due
+        first_pass = False
 
         now = datetime.now(timezone.utc)
 
@@ -893,7 +902,7 @@ def background_tracker():
         except Exception as exc:
             print(f"[TRACKER] Store error: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
-            continue
+            continue  # next iteration still sleeps first — no tight-looping
 
         for info in flights_to_check:
             track_id = info.get("track_id", "?")
@@ -988,33 +997,21 @@ def _icao_to_faa(icao: str) -> str:
 # STARTUP
 # ============================================================================
 
-def start_background_tracker() -> bool:
-    """Start the tracker in exactly one process. Returns True if this is it.
+TRACKER_IS_LEADER = False  # flipped True by _become_leader(), possibly long
+                           # after import if leadership is won on a retry
 
-    This runs at IMPORT time, not under `if __name__ == "__main__"`. Gunicorn
-    imports this module as `app`, so anything gated on __main__ never executes
-    in production — which is why the tracker silently never ran.
 
-    Leader election keeps that fix from creating a worse problem: with
-    --workers 2, every worker would otherwise start its own tracker and bill
-    AeroAPI twice for identical data.
-    """
-    if os.environ.get("DISABLE_TRACKER", "").lower() in ("1", "true", "yes"):
-        print("[TRACKER] Disabled via DISABLE_TRACKER", file=sys.stderr)
-        return False
+def _become_leader() -> None:
+    """Take over as tracker leader: init schema, start the polling thread."""
+    global TRACKER_IS_LEADER
 
-    # Leadership FIRST, schema init SECOND. `store.init()` runs
-    # `CREATE TABLE IF NOT EXISTS`, which is not actually safe against two
+    # Leadership FIRST, schema init SECOND. store.init() runs
+    # CREATE TABLE IF NOT EXISTS, which is not actually safe against two
     # sessions doing it at once on a table that's never existed — both see
     # "doesn't exist" and race, and the loser can hit a UniqueViolation on
-    # Postgres's internal pg_type bookkeeping. Deciding the leader with the
-    # advisory lock BEFORE anyone touches schema means exactly one process,
-    # cluster-wide, ever runs init() — the race can't happen at all.
-    if not store.acquire_leadership():
-        print(f"[TRACKER] Standby (another worker holds the lease), "
-              f"pid={os.getpid()}", file=sys.stderr)
-        return False
-
+    # Postgres's internal pg_type bookkeeping. Only ever calling this from
+    # the confirmed leader means exactly one process, cluster-wide, ever
+    # runs it — the race can't happen at all.
     try:
         store.init()
     except Exception as exc:
@@ -1023,9 +1020,59 @@ def start_background_tracker() -> bool:
 
     thread = threading.Thread(target=background_tracker, daemon=True)
     thread.start()
+    TRACKER_IS_LEADER = True
     print(f"[TRACKER] Background flight tracker started "
           f"(pid={os.getpid()}, store={store.backend_name()})", file=sys.stderr)
-    return True
+
+
+def _watch_for_leadership(poll_seconds: int = 15) -> None:
+    """Keep retrying acquire_leadership() until it succeeds.
+
+    Rolling deploys run the old and new deployment side by side for a short
+    overlap so traffic never drops. Every worker in the new deployment can
+    lose its very first leadership attempt simply because the OLD
+    deployment's leader hasn't been killed yet — that's the overlap working
+    as intended, not a failure. But a one-shot "try once at boot, give up
+    forever" check has no way to notice once the old leader's container is
+    stopped and the lock frees up moments later. This loop is what actually
+    claims it once that happens.
+    """
+    while True:
+        time.sleep(poll_seconds)
+        if store.acquire_leadership():
+            print(f"[TRACKER] Acquired leadership on retry, pid={os.getpid()}",
+                  file=sys.stderr)
+            _become_leader()
+            return
+
+
+def start_background_tracker() -> bool:
+    """Try to become tracker leader now; if that fails, keep retrying.
+
+    Runs at IMPORT time, not under `if __name__ == "__main__"`. Gunicorn
+    imports this module as `app`, so anything gated on __main__ never executes
+    in production — which is why the tracker used to silently never run.
+
+    Leader election keeps that fix from creating a worse problem: with
+    --workers 2, every worker would otherwise start its own tracker and bill
+    AeroAPI twice for identical data.
+
+    Returns whether THIS call won leadership immediately. A False return does
+    not mean this process gave up — see _watch_for_leadership.
+    """
+    if os.environ.get("DISABLE_TRACKER", "").lower() in ("1", "true", "yes"):
+        print("[TRACKER] Disabled via DISABLE_TRACKER", file=sys.stderr)
+        return False
+
+    if store.acquire_leadership():
+        _become_leader()
+        return True
+
+    print(f"[TRACKER] Standby (another worker holds the lease), "
+          f"pid={os.getpid()}", file=sys.stderr)
+    watcher = threading.Thread(target=_watch_for_leadership, daemon=True)
+    watcher.start()
+    return False
 
 
 TRACKER_IS_LEADER = start_background_tracker()
