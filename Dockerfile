@@ -41,8 +41,9 @@ COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/
 
-# Fix Windows/Mac line endings and make executable
-RUN find swim/ -type f -exec dos2unix {} \; 2>/dev/null || true
+# Fix CRLF line endings on shell scripts ONLY (not JARs or binaries)
+RUN find swim/ -type f -name "*.sh" -exec dos2unix {} \; 2>/dev/null || true
+RUN dos2unix swim/bin/run 2>/dev/null || true
 RUN chmod +x swim/bin/run 2>/dev/null || true
 
 # Expose port (Railway sets PORT env var)
