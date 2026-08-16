@@ -1,32 +1,35 @@
 # Pro Flight Tracker — Railway Dockerfile
-# Python 3.12 + Java 21 (for SWIM JMS client)
+# Python 3.12 + Java 25 (required by the SWIM jumpstart JAR)
+#
+# IMPORTANT: swim/lib/jumpstart-jar-with-dependencies.jar is compiled to
+# class file version 69 == Java 25. Java 17 or 21 will NOT run it; the JVM
+# dies immediately with UnsupportedClassVersionError. Do not replace this
+# with `apt-get install default-jdk` — no Debian release ships Java 25 yet.
 
 FROM python:3.12-slim
 
-# Install system dependencies
+# --- Java 25 ---------------------------------------------------------------
+# Copied straight from the official Eclipse Temurin image. No download, no
+# apt repo to go stale, and the version is pinned by the tag.
+COPY --from=eclipse-temurin:25-jre /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    gnupg \
     curl \
     ca-certificates \
     dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenJDK 21+ (required for SWIM jumpstart JAR)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    default-jdk \
-    && rm -rf /var/lib/apt/lists/* \
-    || ( \
-    curl -sL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse" -o /tmp/jdk.tar.gz && \
-    mkdir -p /usr/lib/jvm && \
-    tar -xzf /tmp/jdk.tar.gz -C /usr/lib/jvm && \
-    rm /tmp/jdk.tar.gz && \
-    ln -s /usr/lib/jvm/jdk-* /usr/lib/jvm/default && \
-    update-alternatives --install /usr/bin/java java /usr/lib/jvm/default/bin/java 1 \
-    )
-
-# Verify Java
-RUN java -version 2>&1 || echo "WARNING: Java not found — SWIM feeds will not work"
+# Hard gate: fail the BUILD (not the first request) if Java is too old.
+RUN set -eux; \
+    java -version; \
+    ver="$(java -XshowSettings:properties -version 2>&1 \
+           | awk -F'= *' '/java.specification.version/{print $2}')"; \
+    echo "Detected Java specification version: ${ver}"; \
+    [ "${ver}" -ge 25 ] || { \
+      echo "FATAL: SWIM jumpstart JAR requires Java 25+, found ${ver}"; exit 1; }
 
 # Set working directory
 WORKDIR /app
@@ -41,10 +44,18 @@ COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/
 
-# Fix CRLF line endings on shell scripts ONLY (not JARs or binaries)
-RUN find swim/ -type f -name "*.sh" -exec dos2unix {} \; 2>/dev/null || true
-RUN dos2unix swim/bin/run 2>/dev/null || true
-RUN chmod +x swim/bin/run 2>/dev/null || true
+# Normalize line endings and make the launcher executable
+RUN dos2unix swim/bin/run && chmod +x swim/bin/run
+
+# Smoke test: the JAR's main class must at least load under this JVM.
+# It exits non-zero for missing config, which is fine — we only care that
+# it is NOT an UnsupportedClassVersionError.
+RUN set -eux; \
+    out="$(java -jar swim/lib/jumpstart-jar-with-dependencies.jar 2>&1 || true)"; \
+    echo "${out}" | head -5; \
+    case "${out}" in \
+      *UnsupportedClassVersionError*) echo "FATAL: JVM cannot load the SWIM JAR"; exit 1 ;; \
+    esac
 
 # Expose port (Railway sets PORT env var)
 EXPOSE 8080
