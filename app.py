@@ -142,6 +142,93 @@ def clean_ident(value: str, maxlen: int = 16) -> str:
     return v if v.replace("-", "").replace("_", "").isalnum() else ""
 
 
+# ---------------------------------------------------------------------------
+# Airport code normalization
+#
+# The upstream sources disagree about which code they want:
+#   - aviationweather.gov (METAR/TAF/PIREP) needs 4-letter ICAO ("KJFK").
+#     Passing "JFK" returns a non-JSON body and the parse fails, surfacing as
+#     an empty result rather than a clear error.
+#   - FAA NAS status accepts either — it matches on both forms internally.
+#   - FAA RVR wants the 3-letter FAA code ("JFK").
+#
+# Clients shouldn't have to know that. Normalize on the way in, then re-key
+# the response back to whatever the caller actually asked for, so a client
+# that sends "JFK" finds its data under "JFK".
+# ---------------------------------------------------------------------------
+
+# Non-CONUS US airports where ICAO isn't simply "K" + FAA code.
+_FAA_TO_ICAO = {
+    # Alaska
+    "ANC": "PANC", "FAI": "PAFA", "JNU": "PAJN", "KTN": "PAKT", "BET": "PABE",
+    "OTZ": "PAOT", "OME": "PAOM", "SIT": "PASI", "ADQ": "PADQ", "BRW": "PABR",
+    # Hawaii
+    "HNL": "PHNL", "OGG": "PHOG", "KOA": "PHKO", "LIH": "PHLI", "ITO": "PHTO",
+    # Territories
+    "GUM": "PGUM", "SPN": "PGSN", "SJU": "TJSJ", "STT": "TIST", "STX": "TISX",
+    "PPG": "NSTU",
+}
+_ICAO_TO_FAA = {v: k for k, v in _FAA_TO_ICAO.items()}
+
+
+def to_icao(code: str) -> str:
+    """Best-effort 4-letter ICAO. Passes through anything already 4 chars."""
+    c = clean_ident(code)
+    if not c:
+        return ""
+    if len(c) == 4:
+        return c
+    if len(c) == 3:
+        return _FAA_TO_ICAO.get(c, "K" + c)
+    return c
+
+
+def to_faa(code: str) -> str:
+    """Best-effort 3-letter FAA code (what the RVR feed expects)."""
+    c = clean_ident(code)
+    if not c:
+        return ""
+    if len(c) == 3:
+        return c
+    if c in _ICAO_TO_FAA:
+        return _ICAO_TO_FAA[c]
+    if len(c) == 4 and c.startswith("K"):
+        return c[1:]
+    return c
+
+
+def airport_list(raw: str):
+    """Split a comma/space separated airport list into ICAO codes.
+
+    Returns (icao_codes, {icao: as_the_caller_wrote_it}).
+    """
+    mapping = {}
+    codes = []
+    for token in (raw or "").replace(",", " ").split():
+        original = clean_ident(token)
+        if not original:
+            continue
+        icao = to_icao(original)
+        if icao and icao not in mapping:
+            mapping[icao] = original
+            codes.append(icao)
+    return codes, mapping
+
+
+def rekey_airports(payload, mapping: dict):
+    """Rename `data` keys from ICAO back to what the caller requested."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        return payload
+    renamed = {}
+    for key, value in payload["data"].items():
+        renamed[mapping.get(key, key)] = value
+    payload["data"] = renamed
+    # Keep the resolution visible so a client can tell what was actually queried.
+    payload["resolved"] = {orig: icao for icao, orig in mapping.items()
+                           if orig != icao}
+    return payload
+
+
 def clean_duration(value: str, default: int, lo: int = 1, hi: int = 30) -> str:
     """Coerce a duration to a sane int, falling back to the endpoint default."""
     try:
@@ -253,33 +340,29 @@ def flight_track():
 # WEATHER ENDPOINTS
 # ============================================================================
 
+def _airport_weather(command: str):
+    """Shared handler for the ICAO-keyed weather endpoints."""
+    codes, mapping = airport_list(request.args.get("icao", ""))
+    if not codes:
+        return jsonify({
+            "error": "Missing or invalid 'icao' parameter",
+            "hint": "Airport code(s), comma-separated. Both 'JFK' and 'KJFK' work.",
+        }), 400
+
+    data, status = run_script("aviation_weather.py", [command, "--icao"] + codes)
+    return jsonify(rekey_airports(data, mapping)), status
+
+
 @app.route("/api/weather/metar")
 def weather_metar():
     """Get METAR observations."""
-    icao = request.args.get("icao", "")
-    if not icao:
-        return jsonify({"error": "Missing 'icao' parameter"}), 400
-
-    # Support comma-separated list: KJFK,KLGA
-    icao_list = [s.strip() for s in icao.split(",")]
-    args = ["metar", "--icao"] + icao_list
-
-    data, status = run_script("aviation_weather.py", args)
-    return jsonify(data), status
+    return _airport_weather("metar")
 
 
 @app.route("/api/weather/taf")
 def weather_taf():
     """Get TAF terminal forecasts."""
-    icao = request.args.get("icao", "")
-    if not icao:
-        return jsonify({"error": "Missing 'icao' parameter"}), 400
-
-    icao_list = [s.strip() for s in icao.split(",")]
-    args = ["taf", "--icao"] + icao_list
-
-    data, status = run_script("aviation_weather.py", args)
-    return jsonify(data), status
+    return _airport_weather("taf")
 
 
 @app.route("/api/weather/sigmet")
@@ -297,37 +380,43 @@ def weather_sigmet():
 @app.route("/api/weather/pirep")
 def weather_pirep():
     """Get PIREPs near an airport."""
-    icao = request.args.get("icao")
-    distance = request.args.get("distance", "200")
-    if not icao:
-        return jsonify({"error": "Missing 'icao' parameter"}), 400
+    codes, mapping = airport_list(request.args.get("icao", ""))
+    distance = clean_duration(request.args.get("distance", ""), 200, lo=1, hi=500)
+    if not codes:
+        return jsonify({
+            "error": "Missing or invalid 'icao' parameter",
+            "hint": "Airport code, e.g. icao=JFK or icao=KJFK.",
+        }), 400
 
-    args = ["pirep", "--icao", icao, "--distance", distance]
+    args = ["pirep", "--icao"] + codes + ["--distance", distance]
     data, status = run_script("aviation_weather.py", args)
-    return jsonify(data), status
+    return jsonify(rekey_airports(data, mapping)), status
 
 
 @app.route("/api/weather/faa-status")
 def weather_faa_status():
     """Get FAA delay programs (GDP, ground stops, etc.)."""
-    icao = request.args.get("icao", "")
-    if not icao:
-        return jsonify({"error": "Missing 'icao' parameter"}), 400
+    codes, mapping = airport_list(request.args.get("icao", ""))
+    if not codes:
+        return jsonify({
+            "error": "Missing or invalid 'icao' parameter",
+            "hint": "Airport code(s), comma-separated. Both 'JFK' and 'KJFK' work.",
+        }), 400
 
-    icao_list = [s.strip() for s in icao.split(",")]
-    args = ["faa-status", "--icao"] + icao_list
-
-    data, status = run_script("aviation_weather.py", args)
-    return jsonify(data), status
+    data, status = run_script("aviation_weather.py", ["faa-status", "--icao"] + codes)
+    return jsonify(rekey_airports(data, mapping)), status
 
 
 @app.route("/api/weather/brief")
 def weather_brief():
     """Get a full weather briefing for a route."""
-    origin = request.args.get("origin")
-    dest = request.args.get("dest")
+    origin = to_icao(request.args.get("origin", ""))
+    dest = to_icao(request.args.get("dest", ""))
     if not origin or not dest:
-        return jsonify({"error": "Missing 'origin' or 'dest' parameter"}), 400
+        return jsonify({
+            "error": "Missing or invalid 'origin' or 'dest' parameter",
+            "hint": "Airport codes, e.g. origin=JFK&dest=LAX. Both 'JFK' and 'KJFK' work.",
+        }), 400
 
     args = ["brief", "--origin", origin, "--dest", dest]
     data, status = run_script("aviation_weather.py", args, timeout=30)
@@ -346,8 +435,9 @@ def ops_gairmet():
 
     args = ["gairmet"]
     if route:
-        airports = [s.strip() for s in route.split(",")]
-        args += ["--route"] + airports
+        airports, _ = airport_list(route)
+        if airports:
+            args += ["--route"] + airports
     if hazard:
         hazards = [s.strip() for s in hazard.split(",")]
         args += ["--hazard"] + hazards
@@ -359,13 +449,13 @@ def ops_gairmet():
 @app.route("/api/ops/lightning")
 def ops_lightning():
     """Get real-time lightning strikes near an airport."""
-    icao = clean_ident(request.args.get("icao", ""))
+    icao = to_icao(request.args.get("icao", ""))
     radius = clean_duration(request.args.get("radius", ""), 20, lo=1, hi=250)
     duration = clean_duration(request.args.get("duration", ""), 10)
     if not icao:
         return jsonify({
             "error": "Missing or invalid 'icao' parameter",
-            "hint": "Expected an ICAO code, e.g. icao=KJFK",
+            "hint": "Airport code, e.g. icao=JFK or icao=KJFK.",
         }), 400
 
     args = ["lightning", "--icao", icao, "--radius", radius, "--duration", duration]
@@ -376,9 +466,13 @@ def ops_lightning():
 @app.route("/api/ops/rvr")
 def ops_rvr():
     """Get per-runway visual range from FAA sensors."""
-    airport = request.args.get("airport")
+    # RVR is the one feed that wants the 3-letter FAA code, not ICAO.
+    airport = to_faa(request.args.get("airport", "") or request.args.get("icao", ""))
     if not airport:
-        return jsonify({"error": "Missing 'airport' parameter"}), 400
+        return jsonify({
+            "error": "Missing or invalid 'airport' parameter",
+            "hint": "Airport code, e.g. airport=JFK. 'KJFK' and 'icao=' also accepted.",
+        }), 400
 
     args = ["rvr", "--airport", airport]
     data, status = run_script("airport_ops.py", args)
