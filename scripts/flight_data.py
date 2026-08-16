@@ -143,7 +143,40 @@ def aeroapi_headers():
     if not key: return None
     return {"x-apikey": key, "Accept": "application/json"}
 
+def _prefetched_flights(flight_ident):
+    """Reuse a flight status the caller already paid for.
+
+    /api/check runs `status` and then `chain` for the same flight, and both
+    used to hit /flights/{ident} — one wasted AeroAPI query per check. The
+    caller can now pass its Phase 1 result through PFT_PREFETCHED_STATUS
+    (JSON, same shape cmd_status returns) and we skip the duplicate call.
+
+    Returns None when there's nothing usable, so callers fall through to the
+    live API.
+    """
+    raw = os.environ.get("PFT_PREFETCHED_STATUS", "")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # Only reuse it for the flight it actually describes.
+    if (payload.get("flight") or "").upper() != (flight_ident or "").upper():
+        return None
+    flights = (payload.get("data") or {}).get("flights")
+    if not flights or not isinstance(flights, list):
+        return None
+    return flights
+
+
 def aeroapi_flight_status(flight_ident, date=None):
+    prefetched = _prefetched_flights(flight_ident)
+    if prefetched is not None:
+        return prefetched, None
+
     hdrs = aeroapi_headers()
     if not hdrs: return None, "AEROAPI_KEY not set"
     url = f"{AEROAPI_BASE}/flights/{flight_ident}"
