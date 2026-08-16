@@ -805,41 +805,130 @@ def send_push_notification(push_token: str, title: str, body: str, data: dict = 
         return None
 
 
-def extract_risk_level(check_data: dict) -> str:
-    """Extract overall risk level from a flight check response.
-    Returns 'LOW', 'MODERATE', 'HIGH', or 'UNKNOWN'."""
-    # The check endpoint returns raw data — the app does the risk assessment
-    # For push notifications, we do a simplified risk check:
-    data = check_data.get("data", {})
+def _escalate(current: str, candidate: str) -> str:
+    """Return whichever risk level is worse."""
+    return candidate if _risk_rank(candidate) > _risk_rank(current) else current
 
+
+def _extract_flights(flight_status: dict) -> list:
+    """Pull the flight list out of a flight_data.py `status` payload.
+
+    The real shape nests it two deep: {"command":"status","data":{"flights":[...]}}.
+    The bare "flights" fallback is for a payload that's already been unwrapped.
+    """
+    if not isinstance(flight_status, dict):
+        return []
+    inner = flight_status.get("data")
+    if isinstance(inner, dict) and isinstance(inner.get("flights"), list):
+        return inner["flights"]
+    if isinstance(flight_status.get("flights"), list):
+        return flight_status["flights"]
+    return []
+
+
+def _parse_iso(value: str):
+    """Parse an ISO 8601 timestamp, tolerating a trailing Z. None on failure."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _departure_delay_minutes(flight: dict):
+    """Minutes the departure has slipped vs schedule, or None if unknowable.
+
+    AeroAPI status strings are things like "Scheduled" / "En Route" / "Arrived"
+    and often never literally say "Delayed", so comparing the estimated and
+    scheduled times is the reliable signal.
+    """
+    scheduled = _parse_iso(flight.get("scheduled_out"))
+    if not scheduled:
+        return None
+    actual = _parse_iso(flight.get("actual_out"))
+    estimated = _parse_iso(flight.get("estimated_out"))
+    effective = actual or estimated
+    if not effective:
+        return None
+    return (effective - scheduled).total_seconds() / 60.0
+
+
+def _faa_airport_records(faa_status: dict) -> list:
+    """Yield the per-airport records from an aviation_weather.py faa-status payload.
+
+    Real shape: {"command":"faa-status","data":{"KJFK":{...},"KEWR":{...}}}
+    — keyed by ICAO. The old code looked for a top-level "programs" list, which
+    has never existed, so ground stops and GDPs were silently never detected.
+    """
+    if not isinstance(faa_status, dict):
+        return []
+    data = faa_status.get("data")
+    if not isinstance(data, dict):
+        return []
+    return [rec for rec in data.values() if isinstance(rec, dict)]
+
+
+def extract_risk_level(check_data: dict) -> str:
+    """Overall risk level for push notifications: 'LOW', 'MODERATE', or 'HIGH'.
+
+    Deliberately conservative and self-contained — this drives whether the user
+    gets woken up, not what the client displays. /api/check still returns raw
+    data and does no interpretation.
+    """
+    data = check_data.get("data", {})
     risk = "LOW"
 
-    # Check FAA status for GDPs/ground stops
-    faa = data.get("faa_status", {})
-    if isinstance(faa, dict):
-        programs = faa.get("programs", [])
-        if any(p.get("type") == "Ground Stop" for p in programs):
-            risk = "HIGH"
-        elif any(p.get("type") == "GDP" for p in programs):
-            risk = "MODERATE"
+    # ---- FAA delay programs at the airports involved -------------------
+    for record in _faa_airport_records(data.get("faa_status")):
+        if record.get("ground_stops"):
+            risk = _escalate(risk, "HIGH")
+        if record.get("ground_delay_programs"):
+            risk = _escalate(risk, "MODERATE")
+        if record.get("arrival_departure_delays"):
+            risk = _escalate(risk, "MODERATE")
+        if record.get("closures"):
+            risk = _escalate(risk, "MODERATE")
 
-    # Check flight status for delays
-    fs = data.get("flight_status", {})
-    if isinstance(fs, dict):
-        flights = fs.get("flights", [fs]) if "flights" in fs else [fs]
-        for f in flights:
-            status = f.get("status", "")
-            if "cancelled" in status.lower():
-                risk = "HIGH"
-            elif "delayed" in status.lower() and risk != "HIGH":
-                risk = "MODERATE"
+    # ---- The flight itself ---------------------------------------------
+    for flight in _extract_flights(data.get("flight_status")):
+        if not isinstance(flight, dict):
+            continue
 
-    # Check TFMS flow for GDP advisories
-    flow = data.get("tfms_flow_gdp", {})
+        if flight.get("cancelled") or flight.get("diverted"):
+            risk = _escalate(risk, "HIGH")
+            continue
+
+        status = (flight.get("status") or "").lower()
+        if "cancel" in status or "divert" in status:
+            risk = _escalate(risk, "HIGH")
+            continue
+        if "delay" in status:
+            risk = _escalate(risk, "MODERATE")
+
+        delay = _departure_delay_minutes(flight)
+        if delay is not None:
+            if delay >= 45:
+                risk = _escalate(risk, "HIGH")
+            elif delay >= 15:
+                risk = _escalate(risk, "MODERATE")
+
+    # ---- TFMS flow advisories (ground stops / GDP issuances) -----------
+    flow = data.get("tfms_flow_gdp")
     if isinstance(flow, dict):
-        results = flow.get("results", [])
-        if any("GDP" in str(r) for r in results) and risk == "LOW":
-            risk = "MODERATE"
+        for result in flow.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            text = f"{result.get('title', '')} {result.get('text', '')}".upper()
+            if not text.strip():
+                text = str(result).upper()
+            # A cancellation advisory is the program ENDING — not a new risk.
+            if "CANCEL" in text or "PURGE" in text:
+                continue
+            if "GROUND STOP" in text or result.get("msg_type") == "RSTR":
+                risk = _escalate(risk, "HIGH")
+            elif "GDP" in text or "GROUND DELAY" in text:
+                risk = _escalate(risk, "MODERATE")
 
     return risk
 
@@ -910,7 +999,7 @@ def background_tracker():
                 flight = info["flight"]
                 date = info["date"]
 
-                # Run a quick check (subset of sources for speed).
+                # Phase 1 — flight status + flow advisories.
                 # flight_data.py status = 2 AeroAPI queries; SWIM is free.
                 quick_tasks = [
                     {
@@ -928,6 +1017,28 @@ def background_tracker():
                 ]
 
                 results = run_scripts_parallel(quick_tasks, max_workers=2)
+
+                # Phase 2 — FAA delay programs for this flight's airports.
+                # The tracker never used to fetch this at all, so ground stops
+                # and GDPs could not possibly be detected no matter how the
+                # risk logic read them. It's a free (non-AeroAPI) call, but it
+                # needs the airports, which only phase 1 can tell us.
+                airports = []
+                for f in _extract_flights(results.get("flight_status", {}).get("data")):
+                    for key in ("origin_icao", "dest_icao"):
+                        code = f.get(key)
+                        if code and code not in airports:
+                            airports.append(code)
+
+                if airports:
+                    faa = run_scripts_parallel([{
+                        "key": "faa_status",
+                        "script": "aviation_weather.py",
+                        "args": ["faa-status", "--icao"] + airports,
+                        "timeout": 15,
+                    }], max_workers=1)
+                    results.update(faa)
+
                 check_data = {"data": {k: v["data"] for k, v in results.items()}}
 
                 new_risk = extract_risk_level(check_data)
@@ -945,15 +1056,29 @@ def background_tracker():
                     print(f"[TRACKER] {flight} {finished} — untracked",
                           file=sys.stderr)
 
-                # Send push notification if risk changed
-                if old_risk and new_risk != old_risk:
-                    emoji = {"LOW": "🟢", "MODERATE": "🟡", "HIGH": "🔴"}.get(new_risk, "⚪")
-                    direction = "↑ Elevated" if _risk_rank(new_risk) > _risk_rank(old_risk) else "↓ Improved"
+                # Notify on a risk transition — and also on the very first
+                # check if the flight is already at risk. Previously the
+                # `old_risk and ...` guard meant a flight that was ALREADY
+                # HIGH when you started tracking it never notified at all,
+                # because there was no prior value to differ from.
+                emoji = {"LOW": "🟢", "MODERATE": "🟡", "HIGH": "🔴"}.get(new_risk, "⚪")
+                title = body_text = None
 
+                if old_risk is None:
+                    if new_risk != "LOW":
+                        title = f"{emoji} {flight} Risk: {new_risk}"
+                        body_text = "Already elevated when tracking started. Tap to see details."
+                elif new_risk != old_risk:
+                    direction = ("↑ Elevated" if _risk_rank(new_risk) > _risk_rank(old_risk)
+                                 else "↓ Improved")
+                    title = f"{emoji} {flight} Risk: {new_risk}"
+                    body_text = f"{direction} from {old_risk}. Tap to see details."
+
+                if title:
                     send_push_notification(
                         info["push_token"],
-                        f"{emoji} {flight} Risk: {new_risk}",
-                        f"{direction} from {old_risk}. Tap to see details.",
+                        title,
+                        body_text,
                         {"flight": flight, "date": date, "risk": new_risk}
                     )
 
