@@ -78,21 +78,51 @@ def load_config():
         return json.load(f)
 
 
+# Set by run_consumer() so main() can surface JVM failures instead of
+# silently reporting "0 messages".
+LAST_STDERR = ''
+
+# JVM/broker failures worth bubbling up to the caller verbatim.
+FATAL_STDERR_MARKERS = (
+    'UnsupportedClassVersionError',   # JRE older than the JAR (needs Java 25+)
+    'Error: Unable to access jarfile',
+    'ClassNotFoundException',
+    'NoClassDefFoundError',
+    'ConfigException',               # a -D property is missing or malformed
+    'Failed to create the connection',
+    'Failed to start the connection',
+    'error 401',                     # bad SWIM credentials
+    'Authentication',
+)
+
+
 def run_consumer(feed: str, duration: int, password: str) -> list:
     """
-    Run the Java jumpstart consumer for `duration` seconds, 
+    Run the Java jumpstart consumer for `duration` seconds,
     return list of (headers_dict, xml_string) tuples.
-    
-    Uses shell `timeout` to cleanly kill the Java process, and separates
+
+    Uses `timeout` to cleanly kill the Java process, and separates
     stdout (message data) from stderr (JVM logging).
+
+    Args are passed as an argv list rather than a shell string: SWIM
+    passwords routinely contain $ ! & ; and quotes, all of which the shell
+    would mangle (or worse, execute).
     """
+    global LAST_STDERR
+
     config = load_config()
     feed_cfg = config['queues'][feed]
     broker = config['provider_urls'][feed_cfg['broker']]
 
-    # Use shell timeout to kill the JVM after duration seconds
-    java_args = ' '.join([
-        f'-Djava.net.preferIPv4Stack=true',
+    if not os.access(RUN_SCRIPT, os.X_OK):
+        try:
+            os.chmod(RUN_SCRIPT, 0o755)
+        except OSError:
+            pass
+
+    cmd = [
+        'timeout', str(duration), str(RUN_SCRIPT),
+        '-Djava.net.preferIPv4Stack=true',
         f'-DproviderUrl={broker}',
         f'-Dqueue={feed_cfg["queue"]}',
         f'-DconnectionFactory={config["connection_factory"]}',
@@ -103,28 +133,34 @@ def run_consumer(feed: str, duration: int, password: str) -> list:
         '-Dmetrics=false',
         '-Djson=false',
         '-Dheaders=true',
-    ])
-    
-    cmd = f'timeout {duration} {RUN_SCRIPT} {java_args}'
+    ]
 
     proc = subprocess.Popen(
         cmd,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(SWIM_DIR),
     )
-    
+
     try:
         stdout, stderr = proc.communicate(timeout=duration + 15)
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
-    
+
     # Only parse stdout (clean message output); stderr is JVM logging
     output = stdout.decode('utf-8', errors='replace') if stdout else ''
+    LAST_STDERR = stderr.decode('utf-8', errors='replace') if stderr else ''
 
     return parse_raw_output(output)
+
+
+def stderr_diagnostic() -> str:
+    """Return a JVM error worth reporting, or '' if stderr looks like noise."""
+    for line in LAST_STDERR.split('\n'):
+        if any(marker in line for marker in FATAL_STDERR_MARKERS):
+            return line.strip()
+    return ''
 
 
 def parse_raw_output(output: str) -> list:
@@ -1294,6 +1330,22 @@ Examples:
     print(f"Connecting to SWIM {args.feed.upper()} feed ({queue_key.upper()} queue) for {args.duration}s...",
           file=sys.stderr)
     raw_messages = run_consumer(queue_key, args.duration, password)
+
+    # If the JVM never got off the ground, say so instead of returning an
+    # empty result set that looks like "the feed was quiet".
+    if not raw_messages:
+        problem = stderr_diagnostic()
+        if problem:
+            print(json.dumps({
+                'feed': args.feed,
+                'error': 'SWIM consumer failed to run',
+                'detail': problem,
+                'hint': ('The jumpstart JAR requires Java 25 or newer. '
+                         'Run `java -version` to check.')
+                        if 'UnsupportedClassVersionError' in problem else '',
+                'stderr_tail': LAST_STDERR[-1500:],
+            }, indent=2))
+            sys.exit(1)
 
     if args.raw:
         print(f"\nRaw messages received: {len(raw_messages)}", file=sys.stderr)
