@@ -1,0 +1,950 @@
+#!/usr/bin/env python3
+"""
+Pro Flight Tracker — API Server
+
+Flask REST API that wraps the CLI scripts as HTTP endpoints.
+Designed for deployment on Railway, called by the Rork iOS app.
+
+Architecture:
+  - Each script (flight_data.py, aviation_weather.py, airport_ops.py,
+    swim_consumer.py) runs as a subprocess, outputs JSON to stdout
+  - This server captures that JSON and returns it as HTTP responses
+  - A background scheduler tracks flights and sends push notifications
+    when risk levels change
+
+All API keys are read from environment variables — never hardcoded.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)  # Allow Rork app to call from any origin
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+DEFAULT_TIMEOUT = 45  # seconds per script call
+SWIM_TIMEOUT = 30     # SWIM feeds need time for JMS connection
+CHECK_TIMEOUT = 120   # full flight check runs many sources
+
+# ---------------------------------------------------------------------------
+# Script runner
+# ---------------------------------------------------------------------------
+
+def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
+               env_extras: dict = None) -> tuple[dict, int]:
+    """Run a Python script as subprocess, return (parsed_json, http_status)."""
+    env = os.environ.copy()
+    # Pass through all API keys from Railway env vars
+    if env_extras:
+        env.update(env_extras)
+
+    cmd = [sys.executable, str(SCRIPTS_DIR / script)] + args
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout, env=env, cwd=str(SCRIPTS_DIR)
+        )
+
+        if result.returncode != 0:
+            return {
+                "error": result.stderr.strip() or "Script failed",
+                "returncode": result.returncode
+            }, 500
+
+        # Try to parse JSON from stdout
+        stdout = result.stdout.strip()
+        if not stdout:
+            return {"error": "Empty output", "stderr": result.stderr.strip()}, 500
+
+        try:
+            data = json.loads(stdout)
+            return data, 200
+        except json.JSONDecodeError:
+            # Some scripts output multiple JSON objects (one per line)
+            lines = stdout.split("\n")
+            results = []
+            for line in lines:
+                line = line.strip()
+                if line:
+                    try:
+                        results.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            if results:
+                return {"results": results}, 200
+            return {"raw_output": stdout[:2000], "stderr": result.stderr[:500]}, 200
+
+    except subprocess.TimeoutExpired:
+        return {"error": f"Script timed out after {timeout}s"}, 504
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)}"}, 500
+
+
+def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
+    """Run multiple script calls in parallel.
+
+    tasks: [{"key": "metar", "script": "aviation_weather.py", "args": [...], "timeout": 15}, ...]
+    Returns: {"key": {result_json}, ...}
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for task in tasks:
+            fut = pool.submit(
+                run_script,
+                task["script"],
+                task["args"],
+                task.get("timeout", DEFAULT_TIMEOUT),
+                task.get("env_extras")
+            )
+            futures[fut] = task["key"]
+
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                data, status = fut.result()
+                results[key] = {"data": data, "status": status}
+            except Exception as e:
+                results[key] = {"data": {"error": str(e)}, "status": 500}
+
+    return results
+
+
+# ============================================================================
+# HEALTH
+# ============================================================================
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "pro-flight-tracker",
+"version": "1.3",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+
+# ============================================================================
+# FLIGHT DATA ENDPOINTS
+# ============================================================================
+
+@app.route("/api/flight/status")
+def flight_status():
+    """Get flight status from AeroAPI."""
+    flight = request.args.get("flight")
+    date = request.args.get("date")
+    if not flight:
+        return jsonify({"error": "Missing 'flight' parameter"}), 400
+
+    args = ["status", "--flight", flight]
+    if date:
+        args += ["--date", date]
+
+    data, status = run_script("flight_data.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/flight/chain")
+def flight_chain():
+    """Get equipment chain (inbound flight, tail, turn time)."""
+    flight = request.args.get("flight")
+    date = request.args.get("date")
+    if not flight:
+        return jsonify({"error": "Missing 'flight' parameter"}), 400
+
+    args = ["chain", "--flight", flight]
+    if date:
+        args += ["--date", date]
+
+    data, status = run_script("flight_data.py", args, timeout=30)
+    return jsonify(data), status
+
+
+@app.route("/api/flight/track")
+def flight_track():
+    """Get real-time aircraft position."""
+    reg = request.args.get("reg")
+    flight = request.args.get("flight")
+    if not reg and not flight:
+        return jsonify({"error": "Missing 'reg' or 'flight' parameter"}), 400
+
+    args = ["track"]
+    if reg:
+        args += ["--reg", reg]
+    elif flight:
+        args += ["--flight", flight]
+
+    data, status = run_script("flight_data.py", args)
+    return jsonify(data), status
+
+
+# ============================================================================
+# WEATHER ENDPOINTS
+# ============================================================================
+
+@app.route("/api/weather/metar")
+def weather_metar():
+    """Get METAR observations."""
+    icao = request.args.get("icao", "")
+    if not icao:
+        return jsonify({"error": "Missing 'icao' parameter"}), 400
+
+    # Support comma-separated list: KJFK,KLGA
+    icao_list = [s.strip() for s in icao.split(",")]
+    args = ["metar", "--icao"] + icao_list
+
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/weather/taf")
+def weather_taf():
+    """Get TAF terminal forecasts."""
+    icao = request.args.get("icao", "")
+    if not icao:
+        return jsonify({"error": "Missing 'icao' parameter"}), 400
+
+    icao_list = [s.strip() for s in icao.split(",")]
+    args = ["taf", "--icao"] + icao_list
+
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/weather/sigmet")
+def weather_sigmet():
+    """Get SIGMETs and Convective SIGMETs."""
+    sig_type = request.args.get("type", "")
+    args = ["sigmet"]
+    if sig_type:
+        args += ["--type", sig_type]
+
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/weather/pirep")
+def weather_pirep():
+    """Get PIREPs near an airport."""
+    icao = request.args.get("icao")
+    distance = request.args.get("distance", "200")
+    if not icao:
+        return jsonify({"error": "Missing 'icao' parameter"}), 400
+
+    args = ["pirep", "--icao", icao, "--distance", distance]
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/weather/faa-status")
+def weather_faa_status():
+    """Get FAA delay programs (GDP, ground stops, etc.)."""
+    icao = request.args.get("icao", "")
+    if not icao:
+        return jsonify({"error": "Missing 'icao' parameter"}), 400
+
+    icao_list = [s.strip() for s in icao.split(",")]
+    args = ["faa-status", "--icao"] + icao_list
+
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/weather/brief")
+def weather_brief():
+    """Get a full weather briefing for a route."""
+    origin = request.args.get("origin")
+    dest = request.args.get("dest")
+    if not origin or not dest:
+        return jsonify({"error": "Missing 'origin' or 'dest' parameter"}), 400
+
+    args = ["brief", "--origin", origin, "--dest", dest]
+    data, status = run_script("aviation_weather.py", args, timeout=30)
+    return jsonify(data), status
+
+
+# ============================================================================
+# AIRPORT OPERATIONS ENDPOINTS
+# ============================================================================
+
+@app.route("/api/ops/gairmet")
+def ops_gairmet():
+    """Get G-AIRMET turbulence forecasts along a route."""
+    route = request.args.get("route", "")
+    hazard = request.args.get("hazard", "")
+
+    args = ["gairmet"]
+    if route:
+        airports = [s.strip() for s in route.split(",")]
+        args += ["--route"] + airports
+    if hazard:
+        hazards = [s.strip() for s in hazard.split(",")]
+        args += ["--hazard"] + hazards
+
+    data, status = run_script("airport_ops.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/ops/lightning")
+def ops_lightning():
+    """Get real-time lightning strikes near an airport."""
+    icao = request.args.get("icao")
+    radius = request.args.get("radius", "20")
+    duration = request.args.get("duration", "10")
+    if not icao:
+        return jsonify({"error": "Missing 'icao' parameter"}), 400
+
+    args = ["lightning", "--icao", icao, "--radius", radius, "--duration", duration]
+    data, status = run_script("airport_ops.py", args, timeout=int(duration) + 15)
+    return jsonify(data), status
+
+
+@app.route("/api/ops/rvr")
+def ops_rvr():
+    """Get per-runway visual range from FAA sensors."""
+    airport = request.args.get("airport")
+    if not airport:
+        return jsonify({"error": "Missing 'airport' parameter"}), 400
+
+    args = ["rvr", "--airport", airport]
+    data, status = run_script("airport_ops.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/ops/atfm")
+def ops_atfm():
+    """Infer Eurocontrol ATFM regulation from delay patterns."""
+    flight = request.args.get("flight")
+    date = request.args.get("date")
+    if not flight:
+        return jsonify({"error": "Missing 'flight' parameter"}), 400
+
+    args = ["atfm-infer", "--flight", flight]
+    if date:
+        args += ["--date", date]
+
+    data, status = run_script("airport_ops.py", args)
+    return jsonify(data), status
+
+
+# ============================================================================
+# FAA SWIM ENDPOINTS
+# ============================================================================
+
+@app.route("/api/swim/tbfm")
+def swim_tbfm():
+    """Get TBFM arrival metering data."""
+    airport = request.args.get("airport")
+    flight = request.args.get("flight")
+    duration = request.args.get("duration", "12")
+
+    args = ["tbfm"]
+    if airport:
+        args += ["--airport", airport]
+    if flight:
+        args += ["--flight", flight]
+    args += ["--duration", duration]
+
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/sfdps")
+def swim_sfdps():
+    """Get SFDPS flight positions (FIXM)."""
+    airport = request.args.get("airport")
+    flight = request.args.get("flight")
+    duration = request.args.get("duration", "10")
+
+    args = ["sfdps"]
+    if airport:
+        args += ["--airport", airport]
+    if flight:
+        args += ["--flight", flight]
+    args += ["--duration", duration]
+
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/itws")
+def swim_itws():
+    """Get ITWS terminal weather alerts."""
+    airport = request.args.get("airport")
+    duration = request.args.get("duration", "12")
+    if not airport:
+        return jsonify({"error": "Missing 'airport' parameter"}), 400
+
+    args = ["itws", "--airport", airport, "--duration", duration]
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/notams")
+def swim_notams():
+    """Get NOTAMs from SWIM FNS feed."""
+    airport = request.args.get("airport")
+    duration = request.args.get("duration", "18")
+    if not airport:
+        return jsonify({"error": "Missing 'airport' parameter"}), 400
+
+    args = ["notams", "--airport", airport, "--duration", duration]
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/stdds")
+def swim_stdds():
+    """Get STDDS surface/TRACON tracks."""
+    airport = request.args.get("airport")
+    duration = request.args.get("duration", "10")
+    if not airport:
+        return jsonify({"error": "Missing 'airport' parameter"}), 400
+
+    args = ["stdds", "--airport", airport, "--duration", duration]
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/tfms-flight")
+def swim_tfms_flight():
+    """Get TFMS flight positions (NAS-authoritative)."""
+    airport = request.args.get("airport")
+    flight = request.args.get("flight")
+    duration = request.args.get("duration", "14")
+
+    args = ["tfms-flight"]
+    if airport:
+        args += ["--airport", airport]
+    if flight:
+        args += ["--flight", flight]
+    args += ["--duration", duration]
+
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/tfms-flow")
+def swim_tfms_flow():
+    """Get TFMS flow info (GDP advisories, TMI assignments, restrictions)."""
+    airport = request.args.get("airport")
+    keyword = request.args.get("keyword")
+    duration = request.args.get("duration", "15")
+
+    args = ["tfms-flow"]
+    if airport:
+        args += ["--airport", airport]
+    if keyword:
+        args += ["--keyword", keyword]
+    args += ["--duration", duration]
+
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+@app.route("/api/swim/tfdm")
+def swim_tfdm():
+    """Get TFDM surface management data."""
+    airport = request.args.get("airport")
+    flight = request.args.get("flight")
+    duration = request.args.get("duration", "14")
+
+    args = ["tfdm"]
+    if airport:
+        args += ["--airport", airport]
+    if flight:
+        args += ["--flight", flight]
+    args += ["--duration", duration]
+
+    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
+    return jsonify(data), status
+
+
+# ============================================================================
+# UNIFIED FLIGHT CHECK — The main endpoint for the Rork app
+# ============================================================================
+
+@app.route("/api/check", methods=["GET", "POST"])
+def check_flight():
+    """Run a comprehensive flight check — pulls ALL data sources in parallel.
+
+    Query params or JSON body:
+      flight (required): e.g. "DL244"
+      date (optional): e.g. "2026-08-16", defaults to today
+
+    Returns a unified JSON object with all data source results, organized
+    for the Rork app to render into the risk assessment UI.
+    """
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        flight = body.get("flight") or request.args.get("flight")
+        date = body.get("date") or request.args.get("date")
+    else:
+        flight = request.args.get("flight")
+        date = request.args.get("date")
+
+    if not flight:
+        return jsonify({"error": "Missing 'flight' parameter"}), 400
+
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Normalize flight format: "DL244" → "DL244", but we need airline code
+    # for SWIM (DAL244)
+    airline_prefix = flight[:2].upper()
+    flight_num = flight[2:]
+    swim_callsign = _iata_to_icao_airline(airline_prefix) + flight_num
+
+    # Build the parallel task list
+    tasks = [
+        # --- Flight Data ---
+        {
+            "key": "flight_status",
+            "script": "flight_data.py",
+            "args": ["status", "--flight", flight, "--date", date],
+            "timeout": 20
+        },
+        {
+            "key": "equipment_chain",
+            "script": "flight_data.py",
+            "args": ["chain", "--flight", flight, "--date", date],
+            "timeout": 30
+        },
+        # --- Weather (origin + dest will be filled from flight_status,
+        #     but we can do a broad pull) ---
+        {
+            "key": "sigmet",
+            "script": "aviation_weather.py",
+            "args": ["sigmet"],
+            "timeout": 15
+        },
+        # --- SWIM feeds ---
+        {
+            "key": "tfms_flow_gdp",
+            "script": "swim_consumer.py",
+            "args": ["tfms-flow", "--keyword", "GDP", "--duration", "12"],
+            "timeout": SWIM_TIMEOUT
+        },
+        {
+            "key": "tfms_flight",
+            "script": "swim_consumer.py",
+            "args": ["tfms-flight", "--flight", swim_callsign, "--duration", "12"],
+            "timeout": SWIM_TIMEOUT
+        },
+    ]
+
+    # Phase 1: Get flight status first (we need origin/dest for weather)
+    status_data, status_code = run_script(
+        "flight_data.py",
+        ["status", "--flight", flight, "--date", date],
+        timeout=20
+    )
+
+    # Extract origin/dest airports from flight status
+    origin_icao = None
+    dest_icao = None
+    if status_code == 200 and isinstance(status_data, dict):
+        origin_icao = status_data.get("origin", {}).get("code_icao") or \
+                       status_data.get("origin_icao")
+        dest_icao = status_data.get("destination", {}).get("code_icao") or \
+                     status_data.get("destination_icao")
+
+        # Try alternate field names
+        if not origin_icao:
+            for f in status_data.get("flights", []):
+                origin_icao = origin_icao or f.get("origin", {}).get("code_icao")
+                dest_icao = dest_icao or f.get("destination", {}).get("code_icao")
+
+    # Phase 2: Now build weather + ops tasks with known airports
+    phase2_tasks = []
+
+    if origin_icao and dest_icao:
+        # Weather for both airports
+        phase2_tasks.extend([
+            {
+                "key": "metar",
+                "script": "aviation_weather.py",
+                "args": ["metar", "--icao", origin_icao, dest_icao],
+                "timeout": 15
+            },
+            {
+                "key": "taf",
+                "script": "aviation_weather.py",
+                "args": ["taf", "--icao", origin_icao, dest_icao],
+                "timeout": 15
+            },
+            {
+                "key": "pirep_origin",
+                "script": "aviation_weather.py",
+                "args": ["pirep", "--icao", origin_icao, "--distance", "200"],
+                "timeout": 15
+            },
+            {
+                "key": "faa_status",
+                "script": "aviation_weather.py",
+                "args": ["faa-status", "--icao", origin_icao, dest_icao],
+                "timeout": 15
+            },
+            {
+                "key": "gairmet",
+                "script":"airport_ops.py",
+                "args": ["gairmet", "--route", origin_icao, dest_icao],
+                "timeout": 20
+            },
+            {
+                "key": "rvr_origin",
+                "script": "airport_ops.py",
+                "args": ["rvr", "--airport", _icao_to_faa(origin_icao)],
+                "timeout": 15
+            },
+            {
+                "key": "lightning_origin",
+                "script": "airport_ops.py",
+                "args": ["lightning", "--icao", origin_icao, "--duration", "5"],
+                "timeout": 20
+            },
+        ])
+
+        # SWIM feeds for origin airport
+        phase2_tasks.extend([
+            {
+                "key": "tbfm",
+                "script": "swim_consumer.py",
+                "args": ["tbfm", "--airport", dest_icao, "--duration", "10"],
+                "timeout": SWIM_TIMEOUT
+            },
+            {
+                "key": "itws_origin",
+                "script": "swim_consumer.py",
+                "args": ["itws", "--airport", origin_icao, "--duration", "10"],
+                "timeout": SWIM_TIMEOUT
+            },
+        ])
+
+        # ATFM for European destinations
+        if dest_icao and len(dest_icao) == 4:
+            prefix = dest_icao[0:2]
+            if prefix in ("EG", "EI", "EH", "EB", "ED", "EK", "EE", "EF",
+                          "EN", "EP", "ES", "ET", "EV", "EY",
+                          "LF", "LI", "LE", "LP", "LG", "LH", "LJ",
+                          "LK", "LO", "LR", "LT", "LZ", "LB", "LW",
+                          "LC", "LD", "LM", "LN", "LS", "LU",
+                          "BI", "GC", "GE", "UD", "UG", "UK"):
+                phase2_tasks.append({
+                    "key": "atfm",
+                    "script": "airport_ops.py",
+                    "args": ["atfm-infer", "--flight", flight, "--date", date],
+                    "timeout": 20
+                })
+
+    # Also run equipment chain in parallel with phase 2
+    phase2_tasks.append({
+        "key": "equipment_chain",
+        "script": "flight_data.py",
+        "args": ["chain", "--flight", flight, "--date", date],
+        "timeout": 30
+    })
+
+    # Run phase 2 in parallel
+    phase2_results = run_scripts_parallel(phase2_tasks, max_workers=8)
+
+    # Also run the initial SWIM tasks in parallel
+    swim_results = run_scripts_parallel(tasks[2:], max_workers=4)
+
+    # Merge everything into a unified response
+    response = {
+        "flight": flight,
+        "date": date,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "origin_icao": origin_icao,
+        "destination_icao": dest_icao,
+        "data": {
+            "flight_status": status_data if status_code == 200 else {"error": status_data},
+        }
+    }
+
+    # Merge phase 2 results
+    for key, result in phase2_results.items():
+        response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
+
+    # Merge SWIM results
+    for key, result in swim_results.items():
+        if key not in response["data"]:
+            response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
+
+    return jsonify(response), 200
+
+
+# ============================================================================
+# FLIGHT TRACKING — Background monitoring with push notifications
+# ============================================================================
+
+# In-memory store for tracked flights (for personal use, this is fine)
+# For persistence across deploys, swap to SQLite or Redis
+tracked_flights: dict[str, dict] = {}
+tracking_lock = threading.Lock()
+
+
+@app.route("/api/track", methods=["POST"])
+def start_tracking():
+    """Start tracking a flight for push notifications.
+
+    JSON body:
+      flight (required): e.g. "DL244"
+      date (optional): defaults to today
+      push_token (required): Expo push token from the app
+      interval_minutes (optional): check interval, default 15
+    """
+    body = request.get_json(silent=True) or {}
+    flight = body.get("flight")
+    push_token = body.get("push_token")
+
+    if not flight or not push_token:
+        return jsonify({"error": "Missing 'flight' and/or 'push_token'"}), 400
+
+    date = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    interval = int(body.get("interval_minutes", 15))
+    track_id = f"{flight}_{date}"
+
+    with tracking_lock:
+        tracked_flights[track_id] = {
+            "flight": flight,
+            "date": date,
+            "push_token": push_token,
+            "interval_minutes": interval,
+            "last_check": None,
+            "last_risk": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return jsonify({
+        "status": "tracking",
+        "track_id": track_id,
+        "interval_minutes": interval,
+        "message": f"Now tracking {flight} on {date}. "
+                   f"You'll get a push notification if the risk level changes."
+    })
+
+
+@app.route("/api/track", methods=["DELETE"])
+def stop_tracking():
+    """Stop tracking a flight."""
+    flight = request.args.get("flight")
+    date = request.args.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    track_id = f"{flight}_{date}"
+
+    with tracking_lock:
+        if track_id in tracked_flights:
+            del tracked_flights[track_id]
+            return jsonify({"status": "stopped", "track_id": track_id})
+        return jsonify({"error": "Not tracking this flight"}), 404
+
+
+@app.route("/api/tracked")
+def list_tracked():
+    """List all currently tracked flights."""
+    with tracking_lock:
+        return jsonify({
+            "tracked": list(tracked_flights.values()),
+            "count": len(tracked_flights)
+        })
+
+
+# ============================================================================
+# BACKGROUND TRACKER THREAD
+# ============================================================================
+
+def send_push_notification(push_token: str, title: str, body: str, data: dict = None):
+    """Send a push notification via Expo Push API."""
+    import urllib.request
+    message = {
+        "to": push_token,
+        "sound": "default",
+        "title": title,
+        "body": body,
+    }
+    if data:
+        message["data"] = data
+
+    req_data = json.dumps([message]).encode("utf-8")
+    req = urllib.request.Request(
+        "https://exp.host/--/api/v2/push/send",
+        data=req_data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[PUSH ERROR] {e}", file=sys.stderr)
+        return None
+
+
+def extract_risk_level(check_data: dict) -> str:
+    """Extract overall risk level from a flight check response.
+    Returns 'LOW', 'MODERATE', 'HIGH', or 'UNKNOWN'."""
+    # The check endpoint returns raw data — the app does the risk assessment
+    # For push notifications, we do a simplified risk check:
+    data = check_data.get("data", {})
+
+    risk = "LOW"
+
+    # Check FAA status for GDPs/ground stops
+    faa = data.get("faa_status", {})
+    if isinstance(faa, dict):
+        programs = faa.get("programs", [])
+        if any(p.get("type") == "Ground Stop" for p in programs):
+            risk = "HIGH"
+        elif any(p.get("type") == "GDP" for p in programs):
+            risk = "MODERATE"
+
+    # Check flight status for delays
+    fs = data.get("flight_status", {})
+    if isinstance(fs, dict):
+        flights = fs.get("flights", [fs]) if "flights" in fs else [fs]
+        for f in flights:
+            status = f.get("status", "")
+            if "cancelled" in status.lower():
+                risk = "HIGH"
+            elif "delayed" in status.lower() and risk != "HIGH":
+                risk = "MODERATE"
+
+    # Check TFMS flow for GDP advisories
+    flow = data.get("tfms_flow_gdp", {})
+    if isinstance(flow, dict):
+        results = flow.get("results", [])
+        if any("GDP" in str(r) for r in results) and risk == "LOW":
+            risk = "MODERATE"
+
+    return risk
+
+
+def background_tracker():
+    """Background thread that periodically checks tracked flights."""
+    while True:
+        time.sleep(60)  # Check every minute if any flights are due
+
+        now = datetime.now(timezone.utc)
+        flights_to_check = []
+
+        with tracking_lock:
+            for track_id, info in tracked_flights.items():
+                last = info.get("last_check")
+                interval = info.get("interval_minutes", 15)
+
+                if last is None:
+                    flights_to_check.append((track_id, info.copy()))
+                else:
+                    last_dt = datetime.fromisoformat(last)
+                    if (now - last_dt) >= timedelta(minutes=interval):
+                        flights_to_check.append((track_id, info.copy()))
+
+        for track_id, info in flights_to_check:
+            try:
+                flight = info["flight"]
+                date = info["date"]
+
+                # Run a quick check (subset of sources for speed)
+                quick_tasks = [
+                    {
+                        "key": "flight_status",
+                        "script": "flight_data.py",
+                        "args": ["status", "--flight", flight, "--date", date],
+                        "timeout": 20
+                    },
+                    {
+                        "key": "tfms_flow_gdp",
+                        "script": "swim_consumer.py",
+                        "args": ["tfms-flow", "--keyword", "GDP", "--duration", "8"],
+                        "timeout": 25
+                    },
+                ]
+
+                results = run_scripts_parallel(quick_tasks, max_workers=2)
+                check_data = {"data": {k: v["data"] for k, v in results.items()}}
+
+                new_risk = extract_risk_level(check_data)
+                old_risk = info.get("last_risk")
+
+                # Update tracking state
+                with tracking_lock:
+                    if track_id in tracked_flights:
+                        tracked_flights[track_id]["last_check"] = now.isoformat()
+                        tracked_flights[track_id]["last_risk"] = new_risk
+
+                # Send push notification if risk changed
+                if old_risk and new_risk != old_risk:
+                    emoji = {"LOW": "🟢", "MODERATE": "🟡", "HIGH": "🔴"}.get(new_risk, "⚪")
+                    direction = "↑ Elevated" if _risk_rank(new_risk) > _risk_rank(old_risk) else "↓ Improved"
+
+                    send_push_notification(
+                        info["push_token"],
+                        f"{emoji} {flight} Risk: {new_risk}",
+                        f"{direction} from {old_risk}. Tap to see details.",
+                        {"flight": flight, "date": date, "risk": new_risk}
+                    )
+
+            except Exception as e:
+                print(f"[TRACKER ERROR] {track_id}: {e}", file=sys.stderr)
+
+
+def _risk_rank(level: str) -> int:
+    return {"LOW": 0, "MODERATE": 1, "HIGH": 2}.get(level, -1)
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+# IATA → ICAO airline code mapping (for SWIM callsigns)
+_AIRLINE_MAP = {
+    "DL": "DAL", "AA": "AAL", "UA": "UAL", "WN": "SWA", "B6": "JBU",
+    "AS": "ASA", "NK": "NKS", "F9": "FFT", "HA": "HAL", "SY": "SCX",
+    "G4": "AAY", "BA": "BAW", "AF": "AFR", "LH": "DLH", "KL": "KLM",
+    "AZ": "ITY", "IB": "IBE", "EI": "EIN", "AY": "FIN", "SK": "SAS",
+    "TP": "TAP", "TK": "THY", "EK": "UAE", "QR": "QTR", "CX": "CPA",
+    "SQ": "SIA", "NH": "ANA", "JL": "JAL", "QF": "QFA", "AC": "ACA",
+    "AM": "AMX", "VS": "VIR", "LX": "SWR", "OS": "AUA", "SN": "BEL",
+    "AT": "RAM",
+}
+
+
+def _iata_to_icao_airline(iata: str) -> str:
+    return _AIRLINE_MAP.get(iata.upper(), iata.upper())
+
+
+def _icao_to_faa(icao: str) -> str:
+    """Convert ICAO code to FAA/IATA (strip K prefix for US airports)."""
+    if icao and len(icao) == 4 and icao.startswith("K"):
+        return icao[1:]
+    return icao
+
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+if __name__ == "__main__":
+    # Start background tracker thread
+    tracker_thread = threading.Thread(target=background_tracker, daemon=True)
+    tracker_thread.start()
+    print("[TRACKER] Background flight tracker started", file=sys.stderr)
+
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
