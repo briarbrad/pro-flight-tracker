@@ -879,6 +879,15 @@ def parse_tfms_flight(messages: list, airport: str = None, flight: str = None) -
                             'type': elem.get('etdType', ''),
                             'time': elem.get('timeValue', ''),
                         }
+                    elif lname in ('ctd', 'edct', 'controlledDepartureTime',
+                                   'expectedDepartureClearanceTime'):
+                        val = elem.get('timeValue') or (elem.text or '').strip()
+                        if val:
+                            record['edct'] = val  # FAA-assigned wheels-up time
+                    elif lname in ('cta', 'controlledArrivalTime'):
+                        val = elem.get('timeValue') or (elem.text or '').strip()
+                        if val:
+                            record['cta'] = val  # controlled arrival time
 
             elif msg_type == 'departureInformation':
                 for elem in msg.iter():
@@ -899,7 +908,12 @@ def parse_tfms_flight(messages: list, airport: str = None, flight: str = None) -
             elif msg_type == 'flightPlanAmendmentInformation':
                 for elem in msg.iter():
                     lname = _local(elem.tag)
-                    if lname == 'newFlightAircraftSpecs' and elem.text:
+                    if lname in ('ctd', 'edct', 'controlledDepartureTime',
+                                 'expectedDepartureClearanceTime'):
+                        val = elem.get('timeValue') or (elem.text or '').strip()
+                        if val:
+                            record['edct'] = val
+                    elif lname == 'newFlightAircraftSpecs' and elem.text:
                         record['aircraft_type'] = elem.text
                     elif lname == 'newRouteOfFlight':
                         record['route'] = elem.get('legacyFormat', '')
