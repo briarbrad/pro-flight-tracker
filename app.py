@@ -37,7 +37,9 @@ CORS(app)  # Allow Rork app to call from any origin
 
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 DEFAULT_TIMEOUT = 45  # seconds per script call
-SWIM_TIMEOUT = 30     # SWIM feeds need time for JMS connection
+SWIM_TIMEOUT = 45     # SWIM feeds need time for JMS connection + JVM startup
+                      # (must exceed max --duration by ~15s: JVM start, TLS
+                      #  handshake, and JMS teardown all happen outside it)
 CHECK_TIMEOUT = 120   # full flight check runs many sources
 
 # ---------------------------------------------------------------------------
@@ -61,8 +63,21 @@ def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
         )
 
         if result.returncode != 0:
+            # Scripts report real failures as JSON on stdout and exit nonzero.
+            # stderr is progress chatter ("Connecting to SWIM ..."), so prefer
+            # stdout — otherwise the useful diagnostic gets thrown away.
+            stdout = result.stdout.strip()
+            if stdout:
+                try:
+                    payload = json.loads(stdout)
+                    if isinstance(payload, dict):
+                        payload.setdefault("returncode", result.returncode)
+                        return payload, 500
+                except json.JSONDecodeError:
+                    pass
             return {
                 "error": result.stderr.strip() or "Script failed",
+                "stdout_tail": stdout[-1000:],
                 "returncode": result.returncode
             }, 500
 
@@ -93,6 +108,45 @@ def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
         return {"error": f"Script timed out after {timeout}s"}, 504
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)}"}, 500
+
+
+# ---------------------------------------------------------------------------
+# Query-parameter sanitizing
+#
+# Values from request.args go straight into a subprocess argv list. They are
+# not shell-interpreted, but they ARE parsed by argparse in the child script,
+# so junk in a URL (a stray quote, a value that starts with "-") crashes the
+# script with an exit code 2 instead of returning a useful error. Clean them
+# here so a malformed URL degrades gracefully instead of 500-ing.
+# ---------------------------------------------------------------------------
+
+# Quote characters that commonly ride along from a mis-quoted curl/shell call,
+# including the smart quotes that appear when a command is pasted from chat.
+_STRAY = '\'"`‘’“” \t\r\n'
+
+
+def clean_param(value: str, maxlen: int = 32) -> str:
+    """Strip stray quotes/whitespace. Returns '' for anything unusable."""
+    if not value:
+        return ""
+    v = value.strip(_STRAY)[:maxlen]
+    # A value starting with '-' would be read as a flag by argparse.
+    return "" if v.startswith("-") else v
+
+
+def clean_ident(value: str, maxlen: int = 16) -> str:
+    """Clean an airport/flight/keyword identifier: alphanumerics only."""
+    v = clean_param(value, maxlen).upper()
+    return v if v.replace("-", "").replace("_", "").isalnum() else ""
+
+
+def clean_duration(value: str, default: int, lo: int = 1, hi: int = 30) -> str:
+    """Coerce a duration to a sane int, falling back to the endpoint default."""
+    try:
+        n = int(clean_param(value, 8))
+    except (TypeError, ValueError):
+        n = default
+    return str(max(lo, min(hi, n)))
 
 
 def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
@@ -303,11 +357,14 @@ def ops_gairmet():
 @app.route("/api/ops/lightning")
 def ops_lightning():
     """Get real-time lightning strikes near an airport."""
-    icao = request.args.get("icao")
-    radius = request.args.get("radius", "20")
-    duration = request.args.get("duration", "10")
+    icao = clean_ident(request.args.get("icao", ""))
+    radius = clean_duration(request.args.get("radius", ""), 20, lo=1, hi=250)
+    duration = clean_duration(request.args.get("duration", ""), 10)
     if not icao:
-        return jsonify({"error": "Missing 'icao' parameter"}), 400
+        return jsonify({
+            "error": "Missing or invalid 'icao' parameter",
+            "hint": "Expected an ICAO code, e.g. icao=KJFK",
+        }), 400
 
     args = ["lightning", "--icao", icao, "--radius", radius, "--duration", duration]
     data, status = run_script("airport_ops.py", args, timeout=int(duration) + 15)
@@ -346,110 +403,26 @@ def ops_atfm():
 # FAA SWIM ENDPOINTS
 # ============================================================================
 
-@app.route("/api/swim/tbfm")
-def swim_tbfm():
-    """Get TBFM arrival metering data."""
-    airport = request.args.get("airport")
-    flight = request.args.get("flight")
-    duration = request.args.get("duration", "12")
+def _swim_call(feed: str, default_duration: int, airport_required: bool = False,
+               allow_flight: bool = False, allow_keyword: bool = False):
+    """Shared handler for the SWIM endpoints. Sanitizes every query param."""
+    airport = clean_ident(request.args.get("airport", ""))
+    flight = clean_ident(request.args.get("flight", ""))
+    keyword = clean_ident(request.args.get("keyword", ""))
+    duration = clean_duration(request.args.get("duration", ""), default_duration)
 
-    args = ["tbfm"]
+    if airport_required and not airport:
+        return jsonify({
+            "error": "Missing or invalid 'airport' parameter",
+            "hint": "Expected an ICAO code, e.g. airport=KJFK",
+        }), 400
+
+    args = [feed]
     if airport:
         args += ["--airport", airport]
-    if flight:
+    if allow_flight and flight:
         args += ["--flight", flight]
-    args += ["--duration", duration]
-
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/sfdps")
-def swim_sfdps():
-    """Get SFDPS flight positions (FIXM)."""
-    airport = request.args.get("airport")
-    flight = request.args.get("flight")
-    duration = request.args.get("duration", "10")
-
-    args = ["sfdps"]
-    if airport:
-        args += ["--airport", airport]
-    if flight:
-        args += ["--flight", flight]
-    args += ["--duration", duration]
-
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/itws")
-def swim_itws():
-    """Get ITWS terminal weather alerts."""
-    airport = request.args.get("airport")
-    duration = request.args.get("duration", "12")
-    if not airport:
-        return jsonify({"error": "Missing 'airport' parameter"}), 400
-
-    args = ["itws", "--airport", airport, "--duration", duration]
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/notams")
-def swim_notams():
-    """Get NOTAMs from SWIM FNS feed."""
-    airport = request.args.get("airport")
-    duration = request.args.get("duration", "18")
-    if not airport:
-        return jsonify({"error": "Missing 'airport' parameter"}), 400
-
-    args = ["notams", "--airport", airport, "--duration", duration]
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/stdds")
-def swim_stdds():
-    """Get STDDS surface/TRACON tracks."""
-    airport = request.args.get("airport")
-    duration = request.args.get("duration", "10")
-    if not airport:
-        return jsonify({"error": "Missing 'airport' parameter"}), 400
-
-    args = ["stdds", "--airport", airport, "--duration", duration]
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/tfms-flight")
-def swim_tfms_flight():
-    """Get TFMS flight positions (NAS-authoritative)."""
-    airport = request.args.get("airport")
-    flight = request.args.get("flight")
-    duration = request.args.get("duration", "14")
-
-    args = ["tfms-flight"]
-    if airport:
-        args += ["--airport", airport]
-    if flight:
-        args += ["--flight", flight]
-    args += ["--duration", duration]
-
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
-
-
-@app.route("/api/swim/tfms-flow")
-def swim_tfms_flow():
-    """Get TFMS flow info (GDP advisories, TMI assignments, restrictions)."""
-    airport = request.args.get("airport")
-    keyword = request.args.get("keyword")
-    duration = request.args.get("duration", "15")
-
-    args = ["tfms-flow"]
-    if airport:
-        args += ["--airport", airport]
-    if keyword:
+    if allow_keyword and keyword:
         args += ["--keyword", keyword]
     args += ["--duration", duration]
 
@@ -457,22 +430,52 @@ def swim_tfms_flow():
     return jsonify(data), status
 
 
+@app.route("/api/swim/tbfm")
+def swim_tbfm():
+    """Get TBFM arrival metering data."""
+    return _swim_call("tbfm", 12, allow_flight=True)
+
+
+@app.route("/api/swim/sfdps")
+def swim_sfdps():
+    """Get SFDPS flight positions (FIXM)."""
+    return _swim_call("sfdps", 10, allow_flight=True)
+
+
+@app.route("/api/swim/itws")
+def swim_itws():
+    """Get ITWS terminal weather alerts."""
+    return _swim_call("itws", 12, airport_required=True)
+
+
+@app.route("/api/swim/notams")
+def swim_notams():
+    """Get NOTAMs from SWIM FNS feed."""
+    return _swim_call("notams", 18, airport_required=True)
+
+
+@app.route("/api/swim/stdds")
+def swim_stdds():
+    """Get STDDS surface/TRACON tracks."""
+    return _swim_call("stdds", 10, airport_required=True)
+
+
+@app.route("/api/swim/tfms-flight")
+def swim_tfms_flight():
+    """Get TFMS flight positions (NAS-authoritative)."""
+    return _swim_call("tfms-flight", 14, allow_flight=True)
+
+
+@app.route("/api/swim/tfms-flow")
+def swim_tfms_flow():
+    """Get TFMS flow info (GDP advisories, TMI assignments, restrictions)."""
+    return _swim_call("tfms-flow", 15, allow_keyword=True)
+
+
 @app.route("/api/swim/tfdm")
 def swim_tfdm():
     """Get TFDM surface management data."""
-    airport = request.args.get("airport")
-    flight = request.args.get("flight")
-    duration = request.args.get("duration", "14")
-
-    args = ["tfdm"]
-    if airport:
-        args += ["--airport", airport]
-    if flight:
-        args += ["--flight", flight]
-    args += ["--duration", duration]
-
-    data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
-    return jsonify(data), status
+    return _swim_call("tfdm", 14, allow_flight=True)
 
 
 # ============================================================================
