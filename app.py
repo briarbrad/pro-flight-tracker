@@ -1267,19 +1267,28 @@ def background_tracker():
 
                 results = run_scripts_parallel(quick_tasks, max_workers=2)
 
-                # Phase 2 — FAA delay programs for this flight's airports.
-                # The tracker never used to fetch this at all, so ground stops
-                # and GDPs could not possibly be detected no matter how the
-                # risk logic read them. It's a free (non-AeroAPI) call, but it
-                # needs the airports, which only phase 1 can tell us.
+                # Horizon gate. Without this the tracker escalates on a delay
+                # program that is active RIGHT NOW for a flight leaving
+                # tomorrow — the program will have expired long before
+                # departure, so the alert is a false alarm. Same reasoning as
+                # /api/brief; see Example 1 in analytical-framework.md.
+                tracked_flights_found = _extract_flights(
+                    results.get("flight_status", {}).get("data"))
+                primary = tracked_flights_found[0] if tracked_flights_found else {}
+                horizon = analysis.compute_horizon(primary, now)
+                plan = analysis.source_plan(horizon["hours_to_departure"])
+
+                # Phase 2 — FAA delay programs, but only when they can still
+                # matter at this horizon. Free call, but a misleading one
+                # when the flight is a day out.
                 airports = []
-                for f in _extract_flights(results.get("flight_status", {}).get("data")):
+                for f in tracked_flights_found:
                     for key in ("origin_icao", "dest_icao"):
                         code = f.get(key)
                         if code and code not in airports:
                             airports.append(code)
 
-                if airports:
+                if airports and plan["faa_status"]["relevant"]:
                     faa = run_scripts_parallel([{
                         "key": "faa_status",
                         "script": "aviation_weather.py",
@@ -1288,7 +1297,15 @@ def background_tracker():
                     }], max_workers=1)
                     results.update(faa)
 
-                check_data = {"data": {k: v["data"] for k, v in results.items()}}
+                # Drop anything the horizon says is not decision-relevant so
+                # it cannot drive an alert.
+                relevance = {"flight_status": True,
+                             "faa_status": plan["faa_status"]["relevant"],
+                             "tfms_flow_gdp": plan["tfms_flow"]["relevant"]}
+                check_data = {"data": {
+                    k: v["data"] for k, v in results.items()
+                    if relevance.get(k, True)
+                }}
 
                 new_risk = extract_risk_level(check_data)
                 old_risk = info.get("last_risk")
