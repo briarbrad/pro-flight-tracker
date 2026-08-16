@@ -996,16 +996,53 @@ def flight_brief():
             sources["equipment_chain"] = {"status": "error", "relevance": "PRIMARY",
                                           "error": chain_data}
 
+    # --- Step 4b: EDCT lookup via SWIM, when close enough to matter.
+    # EDCTs are assigned same-day by traffic management; past ~6h out there
+    # is nothing to find. Free call (SWIM is subscription, not per-query).
+    edct = {}
+    if plan["tfms_flow"]["relevant"]:
+        swim_callsign = _iata_to_icao_airline(flight[:2]) + flight[2:]
+        tfms_data, tfms_code = run_script(
+            "swim_consumer.py",
+            ["tfms-flight", "--flight", swim_callsign, "--duration", "8"],
+            timeout=SWIM_TIMEOUT)
+        if tfms_code == 200 and isinstance(tfms_data, dict):
+            edct = analysis.extract_edct(tfms_data.get("results", []),
+                                         swim_callsign)
+            sources["tfms_edct"] = {
+                "status": "ok", "relevance": "PRIMARY",
+                "provides": "FAA-assigned EDCT / controlled times",
+                "data": edct or {"edct": None,
+                                 "note": "No EDCT assigned to this flight "
+                                         "(normal unless captured by a "
+                                         "traffic management program)"},
+            }
+
     # --- Step 5: deterministic analysis.
     programs = analysis._programs_from_faa(
         (sources.get("faa_status") or {}).get("data"))
     branch = analysis.classify_branch(horizon, programs, turn_analysis, plan)
     verdict = analysis.assess(horizon, branch, turn_analysis, primary)
+    effects = analysis.build_effects(primary, programs, turn_analysis,
+                                     edct, horizon)
+    predictions = analysis.predict_times(primary, edct, horizon)
 
     excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
 
     payload = analysis.build_llm_payload(flight, date, horizon, plan, branch,
                                          verdict, sources)
+    # The model gets the computed effects and predictions as facts, plus a
+    # rule to report rather than re-derive them.
+    payload["facts"]["effects"] = effects
+    payload["facts"]["predicted_times"] = predictions
+    payload["guardrails"].append(
+        "Predicted gate/takeoff/arrival times and any EDCT are already "
+        "computed and included in the facts. Report them with their stated "
+        "basis and uncertainty; never derive alternative times.")
+    payload["system"] += ("\n- Predicted gate/takeoff/arrival times and any "
+                          "EDCT are already computed and included in the "
+                          "facts. Report them with their stated basis and "
+                          "uncertainty; never derive alternative times.")
 
     return jsonify({
         "flight": flight,
@@ -1013,6 +1050,8 @@ def flight_brief():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "horizon": horizon,
         "verdict": verdict,
+        "effects": effects,
+        "predicted_times": predictions,
         "branch_classification": branch,
         "sources_consulted": sorted(k for k, v in sources.items()
                                     if v.get("status") == "ok"),

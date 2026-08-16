@@ -21,7 +21,7 @@ reproduces that mistake, so horizon gating happens before the model is asked
 anything.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -241,8 +241,27 @@ def classify_branch(horizon: dict, programs: list, turn_analysis: dict,
     elif not programs:
         evidence.append("No active FAA delay programs at the relevant airports.")
     else:
-        weather_driven = [p for p in programs if _reason_is_weather(p.get("reason"))]
-        structural = [p for p in programs if not _reason_is_weather(p.get("reason"))]
+        # Three-way split: explicitly structural causes make Branch B;
+        # weather causes make Branch A; an empty or unrecognized reason is
+        # treated as A-with-unknown-cause rather than silently escalating to
+        # B (and therefore HIGH) on missing metadata.
+        def _cause(p):
+            r = (p.get("reason") or "").lower()
+            if any(term in r for term in _STRUCTURAL_REASONS):
+                return "structural"
+            if any(term in r for term in _WEATHER_REASONS):
+                return "weather"
+            return "unknown"
+
+        weather_driven = [p for p in programs if _cause(p) == "weather"]
+        structural = [p for p in programs if _cause(p) == "structural"]
+        unknown_cause = [p for p in programs if _cause(p) == "unknown"]
+        if unknown_cause and not structural:
+            evidence.append(
+                f"{len(unknown_cause)} program(s) have no stated cause — "
+                "treated as transient rather than structural, but worth "
+                "watching.")
+            weather_driven = weather_driven + unknown_cause
         for p in programs:
             evidence.append(
                 f"{p['type']} at {p.get('airport', p.get('airport_key'))}"
@@ -427,4 +446,356 @@ def build_llm_payload(flight_ident: str, date: str, horizon: dict,
         "guardrails": SYNTHESIS_RULES,
         "note": "Send `system` as the system prompt and `user` + "
                 "JSON.stringify(facts) as the user message.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# EDCT extraction
+# ---------------------------------------------------------------------------
+
+def extract_edct(tfms_results: list, callsign: str) -> dict:
+    """Find the FAA-assigned wheels-up time (EDCT) for one flight.
+
+    Scans SWIM tfms-flight results for the callsign and returns the most
+    recent controlled-time assignment. Sources, in order of authority:
+    an explicit `edct`/`ctd` element, or an etd whose type marks it
+    CONTROLLED. Returns {} if the flight has no EDCT — which is the normal
+    case; only flights captured by a traffic management program get one.
+    """
+    if not tfms_results or not callsign:
+        return {}
+    cs = callsign.upper().replace(" ", "")
+    best = {}
+    best_ts = ""
+    for r in tfms_results:
+        if not isinstance(r, dict):
+            continue
+        rid = (r.get("flight_id") or "").upper().replace(" ", "")
+        if rid != cs:
+            continue
+        ts = r.get("source_timestamp") or ""
+
+        edct_time = r.get("edct")
+        etd = r.get("etd") or {}
+        if not edct_time and isinstance(etd, dict):
+            if "CONTROL" in (etd.get("type") or "").upper():
+                edct_time = etd.get("time")
+        if not edct_time:
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best = {
+                "edct": edct_time,
+                "cta": r.get("cta"),
+                "assigned_via": r.get("msg_type", ""),
+                "as_of": ts,
+            }
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Cause -> effect on THIS flight
+# ---------------------------------------------------------------------------
+
+def _block_hours(flight: dict):
+    """Filed block time in hours, or None."""
+    ete = flight.get("filed_ete")
+    try:
+        seconds = float(ete)
+        if seconds > 0:
+            return seconds / 3600.0
+    except (TypeError, ValueError):
+        pass
+    off = parse_iso(flight.get("scheduled_out"))
+    on = parse_iso(flight.get("scheduled_in"))
+    if off and on and on > off:
+        return (on - off).total_seconds() / 3600.0
+    return None
+
+
+def build_effects(flight: dict, programs: list, turn_analysis: dict,
+                  edct: dict, horizon: dict) -> list:
+    """Translate each finding into its effect on THIS flight.
+
+    Every entry is {cause, effect, severity, source}. severity is one of
+    INFO (context, no action), WATCH (could move the flight), ACTION
+    (will move the flight / user should act on it).
+
+    The aviation nuance that matters here: a GDP/ground stop constrains
+    ARRIVALS INTO its airport. For a flight DEPARTING that airport the
+    effect is indirect (congestion, late inbound equipment); for a flight
+    ARRIVING there it is direct (EDCT assignment, airborne holding). The
+    generic "GDP at your airport" framing conflates the two.
+    """
+    effects = []
+    origin = (flight.get("origin_icao") or "").upper()
+    dest = (flight.get("dest_icao") or "").upper()
+    block = _block_hours(flight)
+    long_haul = block is not None and block >= 4.0
+
+    def norm(code):
+        c = (code or "").upper()
+        return c if len(c) == 4 else ("K" + c if len(c) == 3 else c)
+
+    # --- EDCT first: it's the single most actionable item ----------------
+    if edct.get("edct"):
+        effects.append({
+            "cause": f"FAA traffic management has assigned this flight an "
+                     f"EDCT of {edct['edct']}",
+            "effect": "That is the controlled wheels-up time (window is "
+                      "-5/+5 minutes). Expect pushback to be timed so the "
+                      "aircraft reaches the runway for that slot; the "
+                      "schedule times no longer govern.",
+            "severity": "ACTION",
+            "source": "swim_tfms",
+        })
+
+    for p in programs:
+        p_airport = norm(p.get("airport") or p.get("airport_key"))
+        at_origin = p_airport and p_airport == norm(origin)
+        at_dest = p_airport and p_airport == norm(dest)
+        where = "origin" if at_origin else "destination" if at_dest else "other"
+        ptype = p.get("type")
+        reason = p.get("reason") or ""
+        avg = p.get("average_delay") or ""
+
+        if ptype == "GROUND_STOP":
+            if at_dest:
+                effects.append({
+                    "cause": f"Ground stop at {p_airport}"
+                             + (f" ({reason})" if reason else ""),
+                    "effect": "Departures bound for the destination are held "
+                              "on the ground until the stop lifts"
+                              + (f" (expected end {p['expected_end']})"
+                                 if p.get("expected_end") else "")
+                              + ". Expect the departure to hold.",
+                    "severity": "ACTION", "source": "faa_status",
+                })
+            elif at_origin:
+                effects.append({
+                    "cause": f"Ground stop at {p_airport}"
+                             + (f" ({reason})" if reason else ""),
+                    "effect": "This halts flights INBOUND to the origin, not "
+                              "this departure. Direct effect is limited, but "
+                              "inbound equipment for later flights will "
+                              "arrive late and surface congestion builds.",
+                    "severity": "WATCH", "source": "faa_status",
+                })
+        elif ptype == "GDP":
+            if at_dest:
+                effects.append({
+                    "cause": f"Ground delay program at {p_airport}"
+                             + (f", avg delay {avg}" if avg else ""),
+                    "effect": ("This flight is subject to the program and may "
+                               "receive an EDCT. "
+                               + ("None is assigned yet — schedule times "
+                                  "still govern." if not edct.get("edct")
+                                  else "Its EDCT is shown above."))
+                              + (" Long block time gives en-route absorption "
+                                 "capacity, so arrival impact is usually "
+                                 "smaller than the program average."
+                                 if long_haul else ""),
+                    "severity": "WATCH" if not edct.get("edct") else "INFO",
+                    "source": "faa_status",
+                })
+            elif at_origin:
+                effects.append({
+                    "cause": f"Ground delay program at {p_airport}"
+                             + (f", avg delay {avg}" if avg else ""),
+                    "effect": "A GDP meters flights ARRIVING INTO the origin "
+                              "— it does not assign delays to this departure. "
+                              "Expect indirect effects only: gate/taxi "
+                              "congestion and late-arriving aircraft. The "
+                              f"program average ({avg or 'n/a'}) is NOT this "
+                              "flight's expected delay.",
+                    "severity": "INFO", "source": "faa_status",
+                })
+        elif ptype == "ARR_DEP_DELAY":
+            trend = p.get("trend") or ""
+            effects.append({
+                "cause": f"General delays at {p_airport}: "
+                         f"{p.get('min_delay','')}-{p.get('max_delay','')}"
+                         + (f", trend {trend}" if trend else ""),
+                "effect": ("Departure-side delays at the origin apply to this "
+                           "flight's taxi-out and release."
+                           if at_origin else
+                           "Arrival-side delays at the destination may add "
+                           "airborne metering on arrival."),
+                "severity": "WATCH" if "ncreas" in trend else "INFO",
+                "source": "faa_status",
+            })
+        elif ptype == "CLOSURE":
+            effects.append({
+                "cause": f"Closure at {p_airport}",
+                "effect": "Reduced capacity at the "
+                          f"{where} airport — expect knock-on delays.",
+                "severity": "WATCH", "source": "faa_status",
+            })
+
+    # --- Equipment ---------------------------------------------------------
+    if isinstance(turn_analysis, dict):
+        avail = turn_analysis.get("turn_time_available_min")
+        minimum = turn_analysis.get("turn_time_required_min_minimum")
+        standard = turn_analysis.get("turn_time_required_min_standard")
+        cat = turn_analysis.get("aircraft_category", "aircraft")
+        if avail is not None and minimum is not None:
+            if avail < minimum:
+                shortfall = int(minimum - avail)
+                effects.append({
+                    "cause": f"Inbound aircraft leaves only {avail:.0f} min "
+                             f"of turn time ({cat} minimum: {minimum} min)",
+                    "effect": f"Departure is effectively guaranteed to slip "
+                              f"by at least ~{shortfall} min — the aircraft "
+                              "physically cannot turn faster than the minimum.",
+                    "severity": "ACTION", "source": "equipment_chain",
+                })
+            elif standard and avail < standard:
+                effects.append({
+                    "cause": f"Turn time {avail:.0f} min is below the "
+                             f"{standard} min standard for a {cat}",
+                    "effect": "Workable but with no buffer — any inbound slip "
+                              "transfers directly to this departure.",
+                    "severity": "WATCH", "source": "equipment_chain",
+                })
+            else:
+                effects.append({
+                    "cause": f"Turn time {avail:.0f} min vs {standard} min "
+                             f"standard for a {cat}",
+                    "effect": "Equipment is not a constraint. Moderate inbound "
+                              "delays would be absorbed by the buffer.",
+                    "severity": "INFO", "source": "equipment_chain",
+                })
+
+    return effects
+
+
+# ---------------------------------------------------------------------------
+# Predicted times
+# ---------------------------------------------------------------------------
+
+TAXI_OUT_DEFAULT_MIN = 20  # planning figure when no TFDM taxi estimate exists
+
+UNCERTAINTY_BY_BAND = {
+    "IMMINENT": 10, "NEAR": 20, "SAME_DAY": 45,
+    "NEXT_DAY": 90, "DISTANT": None, "DEPARTED": 5, "UNKNOWN": None,
+}
+
+
+def _fmt(dt):
+    return dt.isoformat() if dt else None
+
+
+def _delta_min(a, b):
+    if a and b:
+        return round((a - b).total_seconds() / 60.0)
+    return None
+
+
+def predict_times(flight: dict, edct: dict, horizon: dict,
+                  taxi_out_min: int = None) -> dict:
+    """Deterministic gate/wheels-up/arrival estimates with stated basis.
+
+    Precedence per event: actual > EDCT-derived (for departure legs) >
+    airline estimate > schedule. Every figure carries `basis` so the UI and
+    the LLM can say WHY, and `delay_vs_schedule_min` so 'leaves at X' reads
+    as '+N vs schedule' too. Uncertainty widens with horizon; at DISTANT
+    the honest answer is the schedule itself, flagged as such.
+    """
+    band = horizon.get("band", "UNKNOWN")
+    unc = UNCERTAINTY_BY_BAND.get(band)
+    taxi = taxi_out_min or TAXI_OUT_DEFAULT_MIN
+
+    sched_out = parse_iso(flight.get("scheduled_out"))
+    est_out = parse_iso(flight.get("estimated_out"))
+    act_out = parse_iso(flight.get("actual_out"))
+    sched_off = parse_iso(flight.get("scheduled_off"))
+    est_off = parse_iso(flight.get("estimated_off"))
+    act_off = parse_iso(flight.get("actual_off"))
+    sched_on = parse_iso(flight.get("scheduled_on"))
+    est_on = parse_iso(flight.get("estimated_on"))
+    act_on = parse_iso(flight.get("actual_on"))
+    sched_in = parse_iso(flight.get("scheduled_in"))
+    est_in = parse_iso(flight.get("estimated_in"))
+    act_in = parse_iso(flight.get("actual_in"))
+    edct_dt = parse_iso(edct.get("edct")) if edct else None
+    cta_dt = parse_iso(edct.get("cta")) if edct else None
+
+    # --- Wheels-up (takeoff) ---------------------------------------------
+    if act_off:
+        off = {"time": _fmt(act_off), "basis": "actual takeoff", "status": "ACTUAL"}
+    elif edct_dt:
+        off = {"time": _fmt(edct_dt),
+               "basis": "FAA-assigned EDCT (controlled wheels-up, -5/+5 min window)",
+               "status": "CONTROLLED"}
+    elif est_off:
+        off = {"time": _fmt(est_off), "basis": "airline/FAA estimate",
+               "status": "ESTIMATED"}
+    elif est_out or sched_out:
+        base = est_out or sched_out
+        off = {"time": _fmt(base + timedelta(minutes=taxi)),
+               "basis": f"gate estimate + {taxi} min taxi-out (planning figure)",
+               "status": "DERIVED"}
+    else:
+        off = {"time": None, "basis": "no departure times available",
+               "status": "UNKNOWN"}
+
+    # --- Gate departure (off-block) --------------------------------------
+    if act_out:
+        out = {"time": _fmt(act_out), "basis": "actual gate departure",
+               "status": "ACTUAL"}
+    elif edct_dt:
+        push = edct_dt - timedelta(minutes=taxi)
+        if est_out and est_out > push:
+            push = est_out
+        out = {"time": _fmt(push),
+               "basis": f"EDCT minus ~{taxi} min taxi (crews push to make "
+                        "the wheels-up slot)",
+               "status": "DERIVED"}
+    elif est_out:
+        out = {"time": _fmt(est_out), "basis": "airline estimate",
+               "status": "ESTIMATED"}
+    elif sched_out:
+        out = {"time": _fmt(sched_out), "basis": "schedule (no live estimate)",
+               "status": "SCHEDULED"}
+    else:
+        out = {"time": None, "basis": "no gate times available",
+               "status": "UNKNOWN"}
+
+    # --- Arrival ----------------------------------------------------------
+    if act_in:
+        arr = {"time": _fmt(act_in), "basis": "actual gate arrival",
+               "status": "ACTUAL"}
+    elif est_in:
+        arr = {"time": _fmt(est_in), "basis": "airline/FAA estimate",
+               "status": "ESTIMATED"}
+    elif cta_dt:
+        arr = {"time": _fmt(cta_dt), "basis": "FAA controlled arrival time",
+               "status": "CONTROLLED"}
+    elif est_on:
+        arr = {"time": _fmt(est_on), "basis": "estimated touchdown",
+               "status": "ESTIMATED"}
+    elif sched_in:
+        arr = {"time": _fmt(sched_in), "basis": "schedule (no live estimate)",
+               "status": "SCHEDULED"}
+    else:
+        arr = {"time": None, "basis": "no arrival times available",
+               "status": "UNKNOWN"}
+
+    out["delay_vs_schedule_min"] = _delta_min(parse_iso(out["time"]), sched_out)
+    off["delay_vs_schedule_min"] = _delta_min(parse_iso(off["time"]), sched_off)
+    arr["delay_vs_schedule_min"] = _delta_min(parse_iso(arr["time"]), sched_in)
+
+    return {
+        "gate_departure": out,
+        "takeoff": off,
+        "gate_arrival": arr,
+        "uncertainty_minutes": unc,
+        "uncertainty_note": (f"±{unc} min at this horizon" if unc is not None
+                             else "Too far out for meaningful precision — "
+                                  "times shown are the schedule"),
+        "edct": edct or None,
+        "schedule_reference": {
+            "scheduled_out": _fmt(sched_out), "scheduled_off": _fmt(sched_off),
+            "scheduled_on": _fmt(sched_on), "scheduled_in": _fmt(sched_in),
+        },
     }

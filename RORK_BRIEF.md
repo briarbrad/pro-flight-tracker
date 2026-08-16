@@ -326,6 +326,48 @@ them explicitly and says so.
 }
 ```
 
+
+### `effects` and `predicted_times` (added)
+
+The brief response now carries two more deterministic blocks, both also
+included in `llm_payload.facts`:
+
+**`effects[]`** — every finding rephrased as its effect on THIS flight:
+
+```json
+{
+  "cause": "Ground delay program at KJFK, avg delay 2h07m",
+  "effect": "A GDP meters flights ARRIVING INTO the origin — it does not assign delays to this departure...",
+  "severity": "INFO",          // INFO | WATCH | ACTION
+  "source": "faa_status"
+}
+```
+
+Severity semantics: `ACTION` will move the flight or needs the user's
+attention (EDCT assigned, turn below minimum, ground stop at destination);
+`WATCH` could move it; `INFO` is context. The origin-vs-destination logic is
+encoded here — a GDP at the departure airport is INFO for a departure, ACTION
+territory only for flights arriving there.
+
+**`predicted_times`** — gate departure, takeoff, gate arrival, each with:
+
+```json
+{
+  "time": "2026-08-16T23:41:00Z",
+  "status": "CONTROLLED",       // ACTUAL | CONTROLLED | ESTIMATED | DERIVED | SCHEDULED | UNKNOWN
+  "basis": "FAA-assigned EDCT (controlled wheels-up, -5/+5 min window)",
+  "delay_vs_schedule_min": 16
+}
+```
+
+plus `uncertainty_minutes` (widens with horizon: ±10 IMMINENT, ±20 NEAR,
+±45 SAME_DAY, ±90 NEXT_DAY, null DISTANT) and `edct` (the raw FAA
+assignment with `as_of` and `assigned_via`, or null — null is the normal
+case; only flights captured by a traffic management program get one).
+
+`CONTROLLED` means an FAA-assigned time — treat it as authoritative over any
+airline estimate. EDCTs are fetched via SWIM only within ~6h of departure.
+
 ### Reading the verdict
 
 **`confidence` matters as much as `departure_risk`.** At `NEXT_DAY` or
