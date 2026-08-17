@@ -15,6 +15,7 @@ Architecture:
 All API keys are read from environment variables — never hardcoded.
 """
 
+import copy
 import hmac
 import json
 import os
@@ -26,11 +27,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, has_request_context
 from flask_cors import CORS
 
 import store
 import analysis
+
+# The data scripts are importable modules — run them in-process instead of
+# paying a ~100-300ms interpreter spawn per call. swim_consumer.py is NOT
+# imported: it wraps a JVM and stays a subprocess.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+import flight_data as _mod_flight_data          # noqa: E402
+import aviation_weather as _mod_aviation_weather  # noqa: E402
+import airport_ops as _mod_airport_ops          # noqa: E402
 
 app = Flask(__name__)
 CORS(app)  # Allow Rork app to call from any origin
@@ -173,10 +182,23 @@ def _gate():
 
 # ---------------------------------------------------------------------------
 # Script runner
+#
+# run_script() keeps its original signature — every endpoint, the brief, and
+# the tracker call it unchanged — but the inside is now a pipeline:
+#
+#   run_script -> TTL cache -> circuit breaker -> in-process call (python
+#                                                 modules) or subprocess (SWIM)
+#
+# In-process: flight_data / aviation_weather / airport_ops are imported and
+# their dispatch() runs on a worker thread with a hard result timeout —
+# same timeout semantics as the old subprocess kill, minus the ~100-300ms
+# interpreter spawn per call, plus shared state (cache + breaker) that a
+# process-per-request design made impossible. swim_consumer.py still runs
+# as a subprocess because it wraps a JVM.
 # ---------------------------------------------------------------------------
 
-def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
-               env_extras: dict = None) -> tuple[dict, int]:
+def _run_subprocess(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
+                    env_extras: dict = None) -> tuple[dict, int]:
     """Run a Python script as subprocess, return (parsed_json, http_status)."""
     env = os.environ.copy()
     # Pass through all API keys from Railway env vars
@@ -246,6 +268,279 @@ def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
         return {"error": f"Script timed out after {timeout}s"}, 504
     except Exception as e:
         return {"error": f"{type(e).__name__}: {str(e)}"}, 500
+
+
+# --- In-process execution ---------------------------------------------------
+
+_INPROC_MODULES = {
+    "flight_data.py": _mod_flight_data,
+    "aviation_weather.py": _mod_aviation_weather,
+    "airport_ops.py": _mod_airport_ops,
+}
+
+# Generously sized: these are IO-bound HTTP fetches, and run_scripts_parallel
+# workers block on this pool — it must always be deeper than the outer
+# fan-out (max 10) or a burst could deadlock waiting on itself.
+_INPROC_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="inproc")
+
+
+def _run_inprocess(module, script: str, args: list, timeout: int,
+                   env_extras: dict = None) -> tuple[dict, int]:
+    """Execute a script's dispatch() on a worker thread with a hard timeout.
+
+    A timeout abandons the worker (threads can't be killed) — the underlying
+    HTTP calls carry their own 10-12s socket timeouts, so abandoned work
+    self-terminates shortly after. Matches subprocess-timeout semantics from
+    the caller's point of view.
+    """
+    try:
+        ns = module.build_parser().parse_args([str(a) for a in args])
+    except SystemExit:
+        # argparse rejected the args — same class of failure as the old
+        # "script exited 2" path.
+        return {"error": f"Invalid arguments for {script}: {args}"}, 500
+
+    # The subprocess path passed prefetched status via env var; env vars are
+    # process-global and therefore a race between request threads, so the
+    # in-process path rides it on the namespace instead.
+    if env_extras and env_extras.get("PFT_PREFETCHED_STATUS"):
+        ns.prefetched_status = env_extras["PFT_PREFETCHED_STATUS"]
+
+    fut = _INPROC_POOL.submit(module.dispatch, ns)
+    try:
+        data = fut.result(timeout=timeout)
+    except TimeoutError:
+        fut.cancel()
+        return {"error": f"Script timed out after {timeout}s"}, 504
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)}"}, 500
+
+    if not isinstance(data, dict):
+        return {"error": f"{script} returned {type(data).__name__}, expected dict"}, 500
+    data.setdefault("fetched_at",
+                    data.get("pull_time")
+                    or datetime.now(timezone.utc).isoformat())
+    return data, 200
+
+
+def _execute(script: str, args: list, timeout: int,
+             env_extras: dict = None) -> tuple[dict, int]:
+    module = _INPROC_MODULES.get(script)
+    if module is not None:
+        return _run_inprocess(module, script, args, timeout, env_extras)
+    return _run_subprocess(script, args, timeout, env_extras)
+
+
+# --- TTL cache --------------------------------------------------------------
+#
+# Keyed by (script, args). TTLs follow the codebase's own staleness model
+# (SOURCE_HORIZON / refresh_after_seconds): forecasts hold for 30-60 min,
+# live-ish feeds for minutes, and AeroAPI status for its phase-derived
+# refresh interval — so the server never re-buys data it itself would tell
+# the client hasn't changed yet. Cached responses keep their ORIGINAL
+# fetched_at (the client's freshness caption must reflect source time) and
+# carry a "cache" annotation. Bypass for debugging with ?nocache=1 on any
+# endpoint. Per-worker (gunicorn --workers 2 = two caches), which only
+# means a worst case of one extra fetch per source.
+
+_TTL_BY_CALL = {
+    ("aviation_weather.py", "metar"): 300,
+    ("aviation_weather.py", "taf"): 1800,
+    ("aviation_weather.py", "sigmet"): 1800,
+    ("aviation_weather.py", "isigmet"): 1800,
+    ("aviation_weather.py", "pirep"): 600,
+    ("aviation_weather.py", "faa-status"): 300,
+    ("aviation_weather.py", "brief"): 300,
+    ("airport_ops.py", "gairmet"): 1800,
+    ("airport_ops.py", "tcf"): 1800,
+    ("airport_ops.py", "lightning"): 60,
+    ("airport_ops.py", "rvr"): 120,
+    ("airport_ops.py", "atfm-infer"): 600,
+    ("flight_data.py", "chain"): 600,
+    ("flight_data.py", "track"): 30,
+    ("swim_consumer.py", "tfms-flow"): 300,
+    ("swim_consumer.py", "tfms-flight"): 240,
+    ("swim_consumer.py", "tbfm"): 300,
+    ("swim_consumer.py", "itws"): 300,
+    ("swim_consumer.py", "notams"): 900,
+    ("swim_consumer.py", "stdds"): 180,
+    ("swim_consumer.py", "sfdps"): 300,
+    ("swim_consumer.py", "tfdm"): 240,
+}
+
+_CACHE_MAX_ENTRIES = 500
+_STALE_MAX_SECONDS = 6 * 3600   # never serve anything older than this
+
+_cache_lock = threading.Lock()
+_cache: dict[tuple, dict] = {}  # key -> {data, status, stored_at, ttl}
+
+
+def _cache_key(script: str, args: list) -> tuple:
+    return (script, tuple(str(a) for a in args))
+
+
+def _ttl_for(script: str, args: list, data: dict) -> int:
+    sub = str(args[0]) if args else ""
+    if script == "flight_data.py" and sub == "status":
+        # Phase-derived: an airborne flight's status holds for its refresh
+        # interval; a finished flight never changes again.
+        try:
+            flights = _extract_flights(data)
+            if flights:
+                now = datetime.now(timezone.utc)
+                phase = analysis.compute_phase(flights[0], now)
+                horizon = analysis.compute_horizon(flights[0], now, phase)
+                interval = analysis.refresh_interval(phase, horizon)
+                if interval is None:
+                    return 3600  # terminal — nothing further will change
+                return max(60, min(int(interval), 900))
+        except Exception:
+            pass
+        return 120
+    return _TTL_BY_CALL.get((script, sub), 0)
+
+
+def _cache_get(key: tuple):
+    with _cache_lock:
+        entry = _cache.get(key)
+        return copy.deepcopy(entry) if entry else None
+
+
+def _cache_put(key: tuple, data: dict, status: int, ttl: int) -> None:
+    if ttl <= 0 or status != 200 or not isinstance(data, dict):
+        return
+    with _cache_lock:
+        _cache[key] = {"data": copy.deepcopy(data), "status": status,
+                       "stored_at": time.monotonic(), "ttl": ttl}
+        if len(_cache) > _CACHE_MAX_ENTRIES:
+            now = time.monotonic()
+            expired = [k for k, e in _cache.items()
+                       if now - e["stored_at"] > e["ttl"]]
+            for k in expired:
+                del _cache[k]
+            while len(_cache) > _CACHE_MAX_ENTRIES:
+                oldest = min(_cache, key=lambda k: _cache[k]["stored_at"])
+                del _cache[oldest]
+
+
+def _annotated(entry: dict, stale: bool = False, reason: str = None) -> tuple[dict, int]:
+    data = entry["data"]
+    note = {"hit": True, "age_seconds": int(time.monotonic() - entry["stored_at"])}
+    if stale:
+        note["stale"] = True
+        note["reason"] = reason or "served stale"
+    data["cache"] = note
+    return data, entry["status"]
+
+
+def _nocache_requested() -> bool:
+    return has_request_context() and request.args.get("nocache") == "1"
+
+
+# --- Circuit breaker --------------------------------------------------------
+#
+# Per upstream, not per endpoint: when AeroAPI is down, every flight_data
+# call should stop paying the 10s x 2-attempt timeout tax immediately. Trips
+# after N consecutive failures, then serves stale cache (flagged) or fails
+# fast for the cooldown window; the first call after cooldown is the trial
+# that closes it again. Shared across requests — the whole point of moving
+# in-process.
+
+_BREAKER_THRESHOLD = 3
+_BREAKER_COOLDOWN = 120  # seconds
+
+_breaker_lock = threading.Lock()
+_breakers: dict[str, dict] = {}  # upstream -> {failures, opened_until}
+
+
+def _upstream_for(script: str, args: list) -> str:
+    sub = str(args[0]) if args else ""
+    if script == "flight_data.py":
+        return "aeroapi"
+    if script == "swim_consumer.py":
+        return "swim"
+    if script == "aviation_weather.py":
+        return "faa_nas" if sub == "faa-status" else "awc"
+    if script == "airport_ops.py":
+        return {"lightning": "blitzortung", "rvr": "faa_rvr",
+                "atfm-infer": "aeroapi"}.get(sub, "awc")
+    return script
+
+
+def _breaker_open(upstream: str) -> int:
+    """Seconds until the breaker half-opens, 0 if closed/half-open."""
+    with _breaker_lock:
+        b = _breakers.get(upstream)
+        if not b:
+            return 0
+        remaining = b.get("opened_until", 0) - time.monotonic()
+        return max(0, int(remaining))
+
+
+def _breaker_record(upstream: str, ok: bool) -> None:
+    with _breaker_lock:
+        b = _breakers.setdefault(upstream, {"failures": 0, "opened_until": 0})
+        if ok:
+            b["failures"] = 0
+            b["opened_until"] = 0
+        else:
+            b["failures"] += 1
+            if b["failures"] >= _BREAKER_THRESHOLD:
+                b["opened_until"] = time.monotonic() + _BREAKER_COOLDOWN
+
+
+def _breaker_states() -> dict:
+    with _breaker_lock:
+        now = time.monotonic()
+        return {u: {"failures": b["failures"],
+                    "open_for_seconds": max(0, int(b["opened_until"] - now))}
+                for u, b in _breakers.items() if b["failures"] > 0}
+
+
+# --- The public runner ------------------------------------------------------
+
+def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
+               env_extras: dict = None) -> tuple[dict, int]:
+    """Fetch through cache and breaker. Signature unchanged from the
+    subprocess era — callers don't know any of this exists."""
+    key = _cache_key(script, args)
+    upstream = _upstream_for(script, args)
+    cached = _cache_get(key)
+    now = time.monotonic()
+
+    # 1) Fresh cache hit — no upstream contact at all.
+    if cached and not _nocache_requested():
+        age = now - cached["stored_at"]
+        if age <= cached["ttl"]:
+            return _annotated(cached)
+
+    # 2) Breaker open — serve stale if we can, fail fast if we can't.
+    retry_in = _breaker_open(upstream)
+    if retry_in:
+        if cached and (now - cached["stored_at"]) <= _STALE_MAX_SECONDS:
+            return _annotated(cached, stale=True,
+                              reason=f"{upstream} unavailable (circuit open, "
+                                     f"retry in {retry_in}s)")
+        return {"error": f"Upstream '{upstream}' temporarily unavailable "
+                         f"(circuit open after repeated failures)",
+                "retry_after_seconds": retry_in}, 503
+
+    # 3) Live fetch.
+    data, status = _execute(script, args, timeout, env_extras)
+    _breaker_record(upstream, status == 200)
+
+    if status == 200:
+        _cache_put(key, data, status, _ttl_for(script, args, data))
+        return data, status
+
+    # 4) Fetch failed — a flagged stale answer beats an error for every
+    # consumer here (the brief's partial-result envelope, the tracker, the
+    # client's cards). The flag keeps it honest.
+    if cached and (now - cached["stored_at"]) <= _STALE_MAX_SECONDS:
+        return _annotated(cached, stale=True,
+                          reason=f"live fetch failed "
+                                 f"({(data or {}).get('error', 'unknown')})")
+    return data, status
 
 
 # ---------------------------------------------------------------------------
@@ -458,13 +753,17 @@ def run_scripts_parallel(tasks: list[dict], max_workers: int = 6,
 @app.route("/health")
 def health():
     store_info = store.health_check()
+    with _cache_lock:
+        cache_entries = len(_cache)
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.6",
+        "version": "1.7",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
+        "cache_entries": cache_entries,
+        "breakers": _breaker_states(),
     })
 
 
