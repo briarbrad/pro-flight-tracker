@@ -1,0 +1,711 @@
+diff -N -x __pycache__ -ru pro-flight-tracker-main.batch4/app.py pro-flight-tracker-main/app.py
+--- pro-flight-tracker-main.batch4/app.py	2026-08-17 19:37:53.308614640 +0000
++++ pro-flight-tracker-main/app.py	2026-08-17 19:41:26.162480103 +0000
+@@ -328,9 +328,90 @@
+     module = _INPROC_MODULES.get(script)
+     if module is not None:
+         return _run_inprocess(module, script, args, timeout, env_extras)
++    if script == "swim_consumer.py":
++        served = _swim_daemon_serve(args)
++        if served is not None:
++            return served, 200
+     return _run_subprocess(script, args, timeout, env_extras)
+ 
+ 
++# --- SWIM daemon read path --------------------------------------------------
++#
++# When the long-running consumer (swim_daemon.py, leader process) has a
++# recent heartbeat for a queue, SWIM requests are answered from its stored
++# events instead of spawning a JVM: same "results" shape the subprocess
++# prints, ~0ms instead of 10-45s — and no queue competition, which is what
++# used to let two overlapping requests each see half the message stream.
++# Falls back to the subprocess automatically whenever the daemon is down
++# (local dev, JVM crash-looping, non-daemon queues like tbfm/notams).
++
++# Feeds -> config queue names, mirrored from swim_consumer.FEED_QUEUE_MAP
++# (import kept lazy: swim_consumer pulls in nothing heavy, but the daemon
++# module owns the parser bindings).
++_SWIM_FEED_TO_QUEUE = {
++    "tbfm": "tbfm", "itws": "itws", "notams": "notams", "sfdps": "sfdps",
++    "stdds": "stdds", "tfms-flight": "tfms", "tfms-flow": "tfms",
++    "tfdm": "tfdm",
++}
++
++# How far back a daemon-served window reaches. Generous compared with the
++# 8-18s subprocess capture windows — the daemon has been listening the
++# whole time, which is the point.
++_SWIM_SERVE_WINDOW_SECONDS = 900
++
++
++def _swim_argv_to_query(args: list) -> dict:
++    """["tfms-flight","--flight","DAL5187","--duration","8"] -> fields."""
++    q = {"feed": str(args[0]) if args else "", "airport": None,
++         "flight": None, "keyword": None, "limit": 50}
++    i = 1
++    while i < len(args):
++        a, val = str(args[i]), (str(args[i + 1]) if i + 1 < len(args) else None)
++        if a in ("--airport", "-a"):
++            q["airport"] = val; i += 2
++        elif a in ("--flight", "-f"):
++            q["flight"] = val; i += 2
++        elif a in ("--keyword", "-k"):
++            q["keyword"] = val; i += 2
++        elif a in ("--limit", "-n") and val and val.isdigit():
++            q["limit"] = int(val); i += 2
++        else:
++            i += 2 if val and not val.startswith("-") else 1
++    return q
++
++
++def _swim_daemon_serve(args: list):
++    """Answer a SWIM request from daemon-collected events, or None."""
++    q = _swim_argv_to_query(args)
++    queue_name = _SWIM_FEED_TO_QUEUE.get(q["feed"])
++    if not queue_name:
++        return None
++    try:
++        health = store.swim_daemon_health(queue_name)
++    except Exception:
++        return None
++    if not health.get("alive"):
++        return None
++
++    results = store.swim_recent_events(
++        q["feed"], window_seconds=_SWIM_SERVE_WINDOW_SECONDS,
++        airport=q["airport"], flight=q["flight"], keyword=q["keyword"],
++        limit=q["limit"])
++    return {
++        "feed": q["feed"],
++        "query": {"airport": q["airport"], "flight": q["flight"],
++                  "duration_seconds": None},
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "fetched_at": datetime.now(timezone.utc).isoformat(),
++        "served_from": "daemon",
++        "window_seconds": _SWIM_SERVE_WINDOW_SECONDS,
++        "daemon_last_message_at": health.get("last_message_at"),
++        "total_raw_messages": health.get("messages_total"),
++        "filtered_results": len(results),
++        "results": results,
++    }
++
++
+ # --- TTL cache --------------------------------------------------------------
+ #
+ # Keyed by (script, args). TTLs follow the codebase's own staleness model
+@@ -758,12 +839,14 @@
+     return jsonify({
+         "status": "ok" if store_info.get("ok") else "degraded",
+         "service": "pro-flight-tracker",
+-        "version": "1.7",
++        "version": "1.8",
+         "timestamp": datetime.now(timezone.utc).isoformat(),
+         "store": store_info,
+         "tracker_leader": TRACKER_IS_LEADER,
+         "cache_entries": cache_entries,
+         "breakers": _breaker_states(),
++        "swim_daemon": {q: store.swim_daemon_health(q)
++                        for q in ("tfms", "itws")},
+     })
+ 
+ 
+@@ -2241,6 +2324,16 @@
+     print(f"[TRACKER] Background flight tracker started "
+           f"(pid={os.getpid()}, store={store.backend_name()})", file=sys.stderr)
+ 
++    # The persistent SWIM consumer rides the same leadership: exactly one
++    # process cluster-wide holds the JMS connections, so request-path
++    # fallbacks never compete with it for queue messages.
++    try:
++        import swim_daemon
++        swim_daemon.start(airline_map=_AIRLINE_MAP)
++    except Exception as exc:
++        print(f"[TRACKER] SWIM daemon failed to start: "
++              f"{type(exc).__name__}: {exc}", file=sys.stderr)
++
+ 
+ def _watch_for_leadership(poll_seconds: int = 15) -> None:
+     """Keep retrying acquire_leadership() until it succeeds.
+diff -N -x __pycache__ -ru pro-flight-tracker-main.batch4/store.py pro-flight-tracker-main/store.py
+--- pro-flight-tracker-main.batch4/store.py	2026-08-17 19:37:53.297793222 +0000
++++ pro-flight-tracker-main/store.py	2026-08-17 19:39:45.723082270 +0000
+@@ -151,6 +151,28 @@
+ );
+ """
+ 
++SWIM_SCHEMA = """
++CREATE TABLE IF NOT EXISTS swim_events (
++    id           BIGSERIAL PRIMARY KEY,
++    feed         TEXT NOT NULL,
++    flight       TEXT,
++    airport      TEXT,
++    payload      TEXT NOT NULL,
++    source_ts    TEXT,
++    received_at  TIMESTAMPTZ NOT NULL
++);
++CREATE INDEX IF NOT EXISTS swim_events_feed_time
++    ON swim_events (feed, received_at DESC);
++CREATE TABLE IF NOT EXISTS swim_daemon_status (
++    queue_name      TEXT PRIMARY KEY,
++    last_alive_at   TIMESTAMPTZ,
++    last_message_at TIMESTAMPTZ,
++    messages_total  BIGINT NOT NULL DEFAULT 0,
++    restarts        INTEGER NOT NULL DEFAULT 0,
++    note            TEXT
++);
++"""
++
+ _COLS = ("track_id, flight, flight_date, push_token, interval_minutes, "
+          "last_check, last_risk, created_at, expires_at")
+ 
+@@ -179,6 +201,7 @@
+             with conn.cursor() as cur:
+                 cur.execute(SCHEMA)
+                 cur.execute(EDCT_SCHEMA)
++                cur.execute(SWIM_SCHEMA)
+             conn.commit()
+     except Exception as exc:
+         if "pg_type_typname_nsp_index" in str(exc):
+@@ -415,6 +438,17 @@
+                         "WHERE flight = %s AND flight_date = %s",
+                         _edct_key(flight, date))
+                     row = cur.fetchone()
++                    if not row:
++                        # Any-date fallback: EDCTs are same-day facts and the
++                        # SWIM daemon keys them by the slot's UTC date, which
++                        # can differ from the client's origin-local date near
++                        # midnight. A FRESH entry for this flight under any
++                        # date is almost certainly today's leg.
++                        cur.execute(
++                            "SELECT payload, updated_at FROM edct_cache "
++                            "WHERE flight = %s ORDER BY updated_at DESC LIMIT 1",
++                            (_edct_key(flight, date)[0],))
++                        row = cur.fetchone()
+             if not row:
+                 return None
+             payload, updated_at = row
+@@ -426,6 +460,11 @@
+             return None
+     with _mem_lock:
+         entry = _edct_mem.get(_edct_key(flight, date))
++        if not entry:
++            fkey = _edct_key(flight, date)[0]
++            candidates = [(k, e) for k, e in _edct_mem.items() if k[0] == fkey]
++            if candidates:
++                entry = max(candidates, key=lambda kv: _iso(kv[1]["updated_at"]))[1]
+     if not entry:
+         return None
+     if _parse(entry["updated_at"]) < cutoff:
+@@ -434,6 +473,203 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# SWIM daemon storage
++#
++# The long-running SWIM consumer (swim_daemon.py, leader process only)
++# parses messages as they arrive and writes them here; request paths read
++# recent events instead of spawning a JVM. Rows are pruned aggressively —
++# this is a rolling window, not an archive.
++# ---------------------------------------------------------------------------
++
++SWIM_EVENT_RETENTION_MINUTES = 60
++SWIM_DAEMON_STALE_SECONDS = 90   # heartbeat older than this = daemon not serving
++
++_swim_mem: dict[str, list] = {}          # feed -> [{payload, flight, airport, received_at}]
++_swim_status_mem: dict[str, dict] = {}
++
++
++def swim_record_events(feed: str, records: list) -> None:
++    """Append parsed SWIM records for a feed. Best-effort, never raises."""
++    if not records:
++        return
++    now = _now()
++    rows = []
++    import json as _json
++    for r in records:
++        if not isinstance(r, dict):
++            continue
++        flight = (r.get("flight_id") or r.get("callsign") or "") or None
++        airport = (r.get("airport") or r.get("apt") or "") or None
++        src_ts = (r.get("source_timestamp") or r.get("timestamp") or "") or None
++        rows.append((feed, flight, airport, _json.dumps(r, default=str),
++                     src_ts, now))
++    if not rows:
++        return
++    if using_postgres():
++        try:
++            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
++                with conn.cursor() as cur:
++                    cur.executemany(
++                        "INSERT INTO swim_events "
++                        "(feed, flight, airport, payload, source_ts, received_at) "
++                        "VALUES (%s, %s, %s, %s, %s, %s)", rows)
++                    cur.execute(
++                        "DELETE FROM swim_events WHERE received_at < %s",
++                        (now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES),))
++                conn.commit()
++            return
++        except Exception:
++            pass
++    with _mem_lock:
++        bucket = _swim_mem.setdefault(feed, [])
++        for feed_, flight, airport, payload, src_ts, ts in rows:
++            bucket.append({"payload": payload, "flight": flight,
++                           "airport": airport, "received_at": ts})
++        cutoff = now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES)
++        _swim_mem[feed] = [e for e in bucket if e["received_at"] >= cutoff][-2000:]
++
++
++def swim_recent_events(feed: str, window_seconds: int = 900,
++                       airport: str = None, flight: str = None,
++                       keyword: str = None, limit: int = 50) -> list:
++    """Recent parsed records for a feed, newest first, filtered.
++
++    Filters mirror the subprocess parsers' semantics loosely: airport
++    matches with and without the K prefix, flight matches space-stripped
++    uppercase, keyword is a case-insensitive substring — all against the
++    stored JSON payload, so fields the per-feed parsers set (flight_id,
++    airport, raw text) are all searchable.
++    """
++    import json as _json
++    cutoff = _now() - timedelta(seconds=window_seconds)
++    raw = []
++    if using_postgres():
++        try:
++            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
++                with conn.cursor() as cur:
++                    cur.execute(
++                        "SELECT payload FROM swim_events "
++                        "WHERE feed = %s AND received_at >= %s "
++                        "ORDER BY received_at DESC LIMIT 500",
++                        (feed, cutoff))
++                    raw = [r[0] for r in cur.fetchall()]
++        except Exception:
++            raw = []
++    else:
++        with _mem_lock:
++            raw = [e["payload"] for e in reversed(_swim_mem.get(feed, []))
++                   if e["received_at"] >= cutoff]
++
++    def _match(payload: str) -> bool:
++        up = payload.upper()
++        if airport:
++            a = airport.upper()
++            forms = {a}
++            if len(a) == 4 and a.startswith("K"):
++                forms.add(a[1:])
++            elif len(a) == 3:
++                forms.add("K" + a)
++            if not any(f in up for f in forms):
++                return False
++        if flight:
++            if flight.upper().replace(" ", "") not in up.replace(" ", ""):
++                return False
++        if keyword:
++            if keyword.upper() not in up:
++                return False
++        return True
++
++    out = []
++    for payload in raw:
++        if not _match(payload):
++            continue
++        try:
++            out.append(_json.loads(payload))
++        except (ValueError, TypeError):
++            continue
++        if len(out) >= limit:
++            break
++    return out
++
++
++def swim_daemon_heartbeat(queue_name: str, messages_delta: int = 0,
++                          got_message: bool = False, restarted: bool = False,
++                          note: str = None) -> None:
++    """Daemon liveness ping. Best-effort, never raises."""
++    now = _now()
++    if using_postgres():
++        try:
++            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
++                with conn.cursor() as cur:
++                    cur.execute(
++                        "INSERT INTO swim_daemon_status "
++                        "(queue_name, last_alive_at, last_message_at, "
++                        " messages_total, restarts, note) "
++                        "VALUES (%s, %s, %s, %s, %s, %s) "
++                        "ON CONFLICT (queue_name) DO UPDATE SET "
++                        "last_alive_at = EXCLUDED.last_alive_at, "
++                        "last_message_at = CASE WHEN %s THEN EXCLUDED.last_alive_at "
++                        "                 ELSE swim_daemon_status.last_message_at END, "
++                        "messages_total = swim_daemon_status.messages_total + %s, "
++                        "restarts = swim_daemon_status.restarts + %s, "
++                        "note = COALESCE(%s, swim_daemon_status.note)",
++                        (queue_name, now, now if got_message else None,
++                         messages_delta, 1 if restarted else 0, note,
++                         got_message, messages_delta, 1 if restarted else 0,
++                         note))
++                conn.commit()
++            return
++        except Exception:
++            pass
++    with _mem_lock:
++        s = _swim_status_mem.setdefault(queue_name, {
++            "messages_total": 0, "restarts": 0, "last_message_at": None,
++            "note": None})
++        s["last_alive_at"] = now
++        if got_message:
++            s["last_message_at"] = now
++        s["messages_total"] += messages_delta
++        if restarted:
++            s["restarts"] += 1
++        if note:
++            s["note"] = note
++
++
++def swim_daemon_health(queue_name: str) -> dict:
++    """{"alive": bool, ...} — alive means a recent heartbeat exists."""
++    row = None
++    if using_postgres():
++        try:
++            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
++                with conn.cursor() as cur:
++                    cur.execute(
++                        "SELECT last_alive_at, last_message_at, messages_total, "
++                        "restarts, note FROM swim_daemon_status "
++                        "WHERE queue_name = %s", (queue_name,))
++                    row = cur.fetchone()
++        except Exception:
++            row = None
++        if row:
++            last_alive, last_msg, total, restarts, note = row
++        else:
++            return {"alive": False}
++    else:
++        with _mem_lock:
++            s = _swim_status_mem.get(queue_name)
++        if not s:
++            return {"alive": False}
++        last_alive, last_msg = s.get("last_alive_at"), s.get("last_message_at")
++        total, restarts, note = s["messages_total"], s["restarts"], s.get("note")
++
++    last_alive = _parse(last_alive)
++    alive = bool(last_alive and
++                 (_now() - last_alive).total_seconds() < SWIM_DAEMON_STALE_SECONDS)
++    return {"alive": alive, "last_alive_at": _iso(last_alive),
++            "last_message_at": _iso(_parse(last_msg)) if last_msg else None,
++            "messages_total": total, "restarts": restarts, "note": note}
++
++
++# ---------------------------------------------------------------------------
+ # Leader election
+ #
+ # Exactly one process should run the background tracker. With Postgres we use
+diff -N -x __pycache__ -ru pro-flight-tracker-main.batch4/swim_daemon.py pro-flight-tracker-main/swim_daemon.py
+--- pro-flight-tracker-main.batch4/swim_daemon.py	1970-01-01 00:00:00.000000000 +0000
++++ pro-flight-tracker-main/swim_daemon.py	2026-08-17 19:40:34.078477007 +0000
+@@ -0,0 +1,306 @@
++#!/usr/bin/env python3
++"""
++Long-running SWIM consumer for Pro Flight Tracker.
++
++One persistent Java jumpstart process per configured queue (default: TFMS +
++ITWS), held open by a watchdog thread in the LEADER process only. Messages
++are parsed as they arrive with the exact same parsers the request-path
++subprocess uses (scripts/swim_consumer.py) and written to the store:
++
++  - every parsed record  -> store.swim_record_events (rolling 60-min window)
++  - every EDCT found     -> store.cache_edct (so /api/flight/live?edct=cached
++                            returns FAA-controlled times before anyone runs
++                            a brief)
++  - liveness             -> store.swim_daemon_heartbeat (request paths check
++                            this before deciding daemon-serve vs subprocess)
++
++Why this exists: the per-request consumer model had two structural problems.
++Each call spawned a JVM + TLS JMS connection (5-15s, hence 45s timeouts on
++every brief and check), and JMS queue semantics deliver each message to
++exactly ONE consumer — two overlapping requests silently split the stream,
++so the request that needed an EDCT could miss it. One consumer per queue,
++running continuously, fixes both: no spawn cost, no competition, and the
++message that matters is captured whether or not anyone was asking.
++
++Enabled automatically on the leader when SWIM_PASSWORD is set; disable with
++SWIM_DAEMON=0. Queues via SWIM_DAEMON_QUEUES (comma-separated config-queue
++names, default "tfms,itws").
++"""
++
++import os
++import subprocess
++import sys
++import threading
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
++
++import store  # noqa: E402
++import analysis  # noqa: E402
++import swim_consumer as sc  # noqa: E402  (parsers, config, run script path)
++
++# Which parsers run against each queue's messages. tfms carries both the
++# per-flight stream (EDCTs) and flow advisories, so it feeds two parsers.
++QUEUE_PARSERS = {
++    "tfms": [("tfms-flight", sc.parse_tfms_flight),
++             ("tfms-flow", sc.parse_tfms_flow)],
++    "itws": [("itws", sc.parse_itws)],
++    "tbfm": [("tbfm", sc.parse_tbfm)],
++    "tfdm": [("tfdm", sc.parse_tfdm)],
++    "stdds": [("stdds", sc.parse_stdds)],
++    "sfdps": [("sfdps", sc.parse_sfdps)],
++    "notams": [("notams", sc.parse_notams)],
++}
++
++# ICAO callsign prefix -> IATA airline code, for keying EDCTs the way the
++# client asks for them (DL5187, not DAL5187). Inverse of app._AIRLINE_MAP;
++# injected via start() so there is a single source of truth.
++_ICAO_TO_IATA_AIRLINE: dict = {}
++
++_HEARTBEAT_SECONDS = 20
++_BACKOFF_START = 10
++_BACKOFF_MAX = 300
++
++_threads: list = []
++_stop = threading.Event()
++
++
++class _StreamParser:
++    """Incremental version of swim_consumer.parse_raw_output.
++
++    Same three-state machine (properties / xml body), but fed one line at a
++    time; a completed (headers, xml) message is emitted as soon as its
++    boundary — the next property line or XML declaration — arrives.
++    """
++
++    def __init__(self):
++        self.headers = {}
++        self.xml_lines = []
++        self.in_xml = False
++
++    def feed(self, line: str):
++        """Feed one stdout line; returns a (headers, xml) tuple or None."""
++        stripped = line.strip()
++        if not stripped:
++            return None
++
++        m = sc.re.match(r"^Property name = (.+?); value = (.+)$", stripped)
++        if m:
++            emitted = None
++            if self.in_xml and self.xml_lines:
++                xml_body = "\n".join(self.xml_lines).strip()
++                if xml_body:
++                    emitted = (dict(self.headers), xml_body)
++                self.headers = {}
++                self.xml_lines = []
++                self.in_xml = False
++            self.headers[m.group(1)] = m.group(2)
++            return emitted
++
++        if stripped.startswith("<?xml "):
++            emitted = None
++            if self.in_xml and self.xml_lines:
++                xml_body = "\n".join(self.xml_lines).strip()
++                if xml_body:
++                    emitted = (dict(self.headers), xml_body)
++                self.headers = {}
++                self.xml_lines = []
++            self.in_xml = True
++            self.xml_lines = [stripped]
++            return emitted
++
++        if self.in_xml:
++            self.xml_lines.append(stripped)
++        return None
++
++    def flush(self):
++        """Emit whatever is pending (call when the process exits)."""
++        if self.in_xml and self.xml_lines:
++            xml_body = "\n".join(self.xml_lines).strip()
++            self.headers, self.xml_lines, self.in_xml = {}, [], False
++            if xml_body:
++                return (dict(self.headers), xml_body)
++        return None
++
++
++def _log(msg: str) -> None:
++    print(f"[SWIM-DAEMON] {msg}", file=sys.stderr, flush=True)
++
++
++def _iata_ident_from_callsign(callsign: str) -> str:
++    """DAL5187 -> DL5187. Unknown prefixes pass through unchanged."""
++    cs = (callsign or "").upper().replace(" ", "")
++    for plen in (3, 2):
++        prefix, rest = cs[:plen], cs[plen:]
++        if rest.isdigit() and prefix in _ICAO_TO_IATA_AIRLINE:
++            return _ICAO_TO_IATA_AIRLINE[prefix] + rest
++    return cs
++
++
++def _store_edcts(records: list) -> int:
++    """Find EDCT assignments in parsed tfms-flight records; cache per flight."""
++    by_flight: dict[str, list] = {}
++    for r in records:
++        fid = (r.get("flight_id") or "").upper().replace(" ", "")
++        if fid:
++            by_flight.setdefault(fid, []).append(r)
++    stored = 0
++    for fid, recs in by_flight.items():
++        edct = analysis.extract_edct(recs, fid)
++        if not edct.get("edct"):
++            continue
++        ident = _iata_ident_from_callsign(fid)
++        # Key by the slot's own UTC date; get_cached_edct has an any-date
++        # fallback for the near-midnight origin-local mismatch.
++        date = (edct["edct"] or "")[:10] or \
++            datetime.now(timezone.utc).strftime("%Y-%m-%d")
++        try:
++            store.cache_edct(ident, date, edct)
++            stored += 1
++        except Exception:
++            pass
++    return stored
++
++
++def _handle_message(queue_name: str, msg: tuple) -> int:
++    """Parse one (headers, xml) message with every parser bound to the
++    queue and persist the results. Returns records stored."""
++    total = 0
++    for feed_name, parse_fn in QUEUE_PARSERS.get(queue_name, []):
++        try:
++            records = parse_fn([msg])
++        except Exception as exc:
++            _log(f"{queue_name}/{feed_name} parser error: "
++                 f"{type(exc).__name__}: {exc}")
++            continue
++        if not records:
++            continue
++        try:
++            store.swim_record_events(feed_name, records)
++        except Exception:
++            pass
++        if feed_name == "tfms-flight":
++            _store_edcts(records)
++        total += len(records)
++    return total
++
++
++def _spawn_consumer(queue_name: str, password: str) -> subprocess.Popen:
++    """Start the Java client for one queue — long-running, no `timeout`."""
++    config = sc.load_config()
++    feed_cfg = config["queues"][queue_name]
++    broker = config["provider_urls"][feed_cfg["broker"]]
++
++    if not os.access(sc.RUN_SCRIPT, os.X_OK):
++        try:
++            os.chmod(sc.RUN_SCRIPT, 0o755)
++        except OSError:
++            pass
++
++    cmd = [
++        str(sc.RUN_SCRIPT),
++        "-Djava.net.preferIPv4Stack=true",
++        f"-DproviderUrl={broker}",
++        f"-Dqueue={feed_cfg['queue']}",
++        f"-DconnectionFactory={config['connection_factory']}",
++        f"-Dusername={config['username']}",
++        f"-Dpassword={password}",
++        f"-Dvpn={feed_cfg['vpn']}",
++        "-Doutput=com.harris.cinnato.outputs.StdoutOutput",
++        "-Dmetrics=false",
++        "-Djson=false",
++        "-Dheaders=true",
++    ]
++    return subprocess.Popen(cmd, stdout=subprocess.PIPE,
++                            stderr=subprocess.DEVNULL,
++                            cwd=str(sc.SWIM_DIR))
++
++
++def _consume_queue(queue_name: str, password: str) -> None:
++    """Watchdog loop: keep one consumer alive for this queue forever."""
++    backoff = _BACKOFF_START
++    while not _stop.is_set():
++        proc = None
++        try:
++            proc = _spawn_consumer(queue_name, password)
++            _log(f"{queue_name}: consumer started (pid={proc.pid})")
++            store.swim_daemon_heartbeat(queue_name, restarted=True,
++                                        note="started")
++            parser = _StreamParser()
++            last_beat = time.monotonic()
++            got_any = False
++
++            for raw in proc.stdout:  # blocks; ends when process dies
++                if _stop.is_set():
++                    break
++                line = raw.decode("utf-8", errors="replace")
++                msg = parser.feed(line)
++                if msg:
++                    n = _handle_message(queue_name, msg)
++                    got_any = True
++                    if n:
++                        store.swim_daemon_heartbeat(queue_name,
++                                                    messages_delta=n,
++                                                    got_message=True)
++                        backoff = _BACKOFF_START  # healthy stream
++                if time.monotonic() - last_beat >= _HEARTBEAT_SECONDS:
++                    store.swim_daemon_heartbeat(queue_name)
++                    last_beat = time.monotonic()
++
++            tail = parser.flush()
++            if tail:
++                _handle_message(queue_name, tail)
++
++            rc = proc.wait(timeout=10)
++            _log(f"{queue_name}: consumer exited rc={rc}"
++                 + ("" if got_any else " (no messages seen)"))
++        except Exception as exc:
++            _log(f"{queue_name}: watchdog error {type(exc).__name__}: {exc}")
++        finally:
++            if proc and proc.poll() is None:
++                proc.kill()
++
++        if _stop.is_set():
++            return
++        store.swim_daemon_heartbeat(queue_name,
++                                    note=f"restarting in {backoff}s")
++        _stop.wait(backoff)
++        backoff = min(backoff * 2, _BACKOFF_MAX)
++
++
++def enabled() -> bool:
++    if os.environ.get("SWIM_DAEMON", "").lower() in ("0", "false", "no"):
++        return False
++    return bool(os.environ.get("SWIM_PASSWORD", ""))
++
++
++def queues() -> list:
++    raw = os.environ.get("SWIM_DAEMON_QUEUES", "tfms,itws")
++    return [q.strip() for q in raw.split(",") if q.strip() in QUEUE_PARSERS]
++
++
++def start(airline_map: dict) -> bool:
++    """Start one watchdog thread per configured queue. Leader only.
++
++    airline_map is app.py's IATA->ICAO table; we invert it so EDCTs are
++    keyed the way the client queries them.
++    """
++    global _ICAO_TO_IATA_AIRLINE
++    if not enabled():
++        _log("disabled (SWIM_DAEMON=0 or SWIM_PASSWORD unset)")
++        return False
++    _ICAO_TO_IATA_AIRLINE = {v: k for k, v in (airline_map or {}).items()}
++    password = os.environ["SWIM_PASSWORD"]
++    for q in queues():
++        t = threading.Thread(target=_consume_queue, args=(q, password),
++                             daemon=True, name=f"swim-daemon-{q}")
++        t.start()
++        _threads.append(t)
++    _log(f"started for queues: {', '.join(queues())}")
++    return True
++
++
++def stop() -> None:
++    _stop.set()
