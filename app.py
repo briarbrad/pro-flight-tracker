@@ -15,6 +15,7 @@ Architecture:
 All API keys are read from environment variables — never hardcoded.
 """
 
+import hmac
 import json
 import os
 import subprocess
@@ -44,6 +45,131 @@ SWIM_TIMEOUT = 45     # SWIM feeds need time for JMS connection + JVM startup
                       # (must exceed max --duration by ~15s: JVM start, TLS
                       #  handshake, and JMS teardown all happen outside it)
 CHECK_TIMEOUT = 120   # full flight check runs many sources
+
+
+# ---------------------------------------------------------------------------
+# Auth + rate limiting
+#
+# Every endpoint spends real money (AeroAPI) or real time (SWIM JVM spawns),
+# and the Railway URL is guessable. Two layers, both enforced in a single
+# before_request hook:
+#
+#   1. Bearer-token auth, DORMANT BY DEFAULT. Rollout is three steps so the
+#      shipped app never breaks:
+#        a. Set API_TOKEN on Railway            -> unauthenticated requests
+#           are logged but still served (visibility, zero risk)
+#        b. Ship the client sending the header  -> logs go quiet
+#        c. Set REQUIRE_AUTH=1                  -> missing/wrong token = 401
+#      Unsetting REQUIRE_AUTH is the instant rollback at any point.
+#
+#   2. A per-minute request cap, ALWAYS ON. Fixed 60-second window, counted
+#      per bearer token when one is presented, else per client IP (first hop
+#      of X-Forwarded-For — Railway terminates TLS in front of us). In-memory
+#      by design: with --workers 2 the real cluster-wide cap is up to
+#      2x RATE_LIMIT_PER_MIN, which is fine — this is a bulkhead against
+#      abuse and runaway client loops, not a billing meter.
+#
+# /health stays exempt from both so Railway's healthcheck (and a locked-out
+# operator) can always see the service. CORS preflights (OPTIONS) are exempt
+# from auth because browsers never attach Authorization headers to them.
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_PER_MIN = max(1, int(os.environ.get("RATE_LIMIT_PER_MIN", "60") or 60))
+
+_rate_lock = threading.Lock()
+_rate_buckets: dict[str, tuple[float, int]] = {}  # key -> (window_start, count)
+
+
+def _client_key() -> str:
+    """Rate-limit key: the bearer token if presented, else the client IP."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and len(auth) > 7:
+        return "tok:" + auth[7:15]  # prefix is plenty for bucketing
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return "ip:" + fwd.split(",")[0].strip()
+    return "ip:" + (request.remote_addr or "unknown")
+
+
+def _rate_limited(key: str) -> int:
+    """Count a request against key's window. Returns seconds to wait, 0 = ok."""
+    now = time.monotonic()
+    with _rate_lock:
+        start, count = _rate_buckets.get(key, (now, 0))
+        if now - start >= 60.0:
+            start, count = now, 0
+        count += 1
+        _rate_buckets[key] = (start, count)
+        # Opportunistic prune so the dict can't grow unbounded under an
+        # address-rotating scanner.
+        if len(_rate_buckets) > 1000:
+            cutoff = now - 120.0
+            for k in [k for k, (s, _) in _rate_buckets.items() if s < cutoff]:
+                del _rate_buckets[k]
+    if count > RATE_LIMIT_PER_MIN:
+        return max(1, int(60.0 - (now - start)) + 1)
+    return 0
+
+
+def _token_ok(supplied: str) -> bool:
+    expected = os.environ.get("API_TOKEN", "").strip()
+    if not expected:
+        return False
+    return hmac.compare_digest(supplied.encode(), expected.encode())
+
+
+@app.before_request
+def _gate():
+    # Always let the healthcheck and CORS preflights through.
+    if request.path == "/health" or request.method == "OPTIONS":
+        return None
+
+    # --- Rate cap (always on) ---
+    retry_in = _rate_limited(_client_key())
+    if retry_in:
+        resp = jsonify({
+            "error": "Rate limit exceeded",
+            "limit_per_minute": RATE_LIMIT_PER_MIN,
+            "retry_after_seconds": retry_in,
+        })
+        resp.headers["Retry-After"] = str(retry_in)
+        return resp, 429
+
+    # --- Bearer auth ---
+    api_token = os.environ.get("API_TOKEN", "").strip()
+    require = os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+
+    auth = request.headers.get("Authorization", "")
+    supplied = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    authed = bool(supplied) and _token_ok(supplied)
+
+    if not require:
+        # Dormant mode: serve everything, but make unauthenticated traffic
+        # visible in the deploy logs so we know when the client has caught up
+        # (and whether anyone else is hitting the URL).
+        if api_token and not authed:
+            print(f"[AUTH] Unauthenticated request (not yet enforced): "
+                  f"{request.method} {request.path} from {_client_key()}",
+                  file=sys.stderr)
+        return None
+
+    if not api_token:
+        # REQUIRE_AUTH=1 with no token configured is a misconfiguration.
+        # Fail closed — this flag exists to protect the AeroAPI account —
+        # with an error that says exactly what to fix.
+        return jsonify({
+            "error": "Server misconfigured: REQUIRE_AUTH is set but API_TOKEN is not",
+            "hint": "Set API_TOKEN on Railway, or unset REQUIRE_AUTH",
+        }), 503
+
+    if not authed:
+        return jsonify({
+            "error": "Unauthorized",
+            "hint": "Send 'Authorization: Bearer <token>' matching the server's API_TOKEN",
+        }), 401
+
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Script runner
