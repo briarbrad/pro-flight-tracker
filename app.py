@@ -143,6 +143,23 @@ def clean_ident(value: str, maxlen: int = 16) -> str:
     return v if v.replace("-", "").replace("_", "").isalnum() else ""
 
 
+def clean_date(value: str) -> str:
+    """Validate a YYYY-MM-DD date string. Returns '' for anything else.
+
+    Dates ride into subprocess argv and into AeroAPI result filtering, so
+    anything that isn't a real calendar date is dropped rather than passed
+    through.
+    """
+    v = clean_param(value or "", 10)
+    if not v:
+        return ""
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+        return v
+    except ValueError:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Airport code normalization
 #
@@ -247,14 +264,20 @@ def clean_duration(value: str, default: int, lo: int = 1, hi: int = 30) -> str:
     return str(max(lo, min(hi, n)))
 
 
-def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
+def run_scripts_parallel(tasks: list[dict], max_workers: int = 6,
+                         deadline: float = None) -> dict:
     """Run multiple script calls in parallel.
 
     tasks: [{"key": "metar", "script": "aviation_weather.py", "args": [...], "timeout": 15}, ...]
+    deadline: optional time.monotonic() value; results not in by then are
+        returned as 504 "budget exceeded" entries instead of blocking the
+        request. (The underlying subprocesses still die on their own
+        per-script timeouts; we just stop waiting for them.)
     Returns: {"key": {result_json}, ...}
     """
     results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {}
         for task in tasks:
             fut = pool.submit(
@@ -266,13 +289,29 @@ def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
             )
             futures[fut] = task["key"]
 
-        for fut in as_completed(futures):
-            key = futures[fut]
-            try:
-                data, status = fut.result()
-                results[key] = {"data": data, "status": status}
-            except Exception as e:
-                results[key] = {"data": {"error": str(e)}, "status": 500}
+        remaining = None
+        if deadline is not None:
+            remaining = max(0.5, deadline - time.monotonic())
+        try:
+            for fut in as_completed(futures, timeout=remaining):
+                key = futures[fut]
+                try:
+                    data, status = fut.result()
+                    results[key] = {"data": data, "status": status}
+                except Exception as e:
+                    results[key] = {"data": {"error": str(e)}, "status": 500}
+        except TimeoutError:
+            for fut, key in futures.items():
+                if key not in results:
+                    fut.cancel()
+                    results[key] = {
+                        "data": {"error": "Skipped — request time budget exceeded"},
+                        "status": 504,
+                    }
+    finally:
+        # Don't block the response on threads still babysitting slow
+        # subprocesses; they exit when their own timeouts fire.
+        pool.shutdown(wait=deadline is None, cancel_futures=True)
 
     return results
 
@@ -283,11 +322,14 @@ def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
 
 @app.route("/health")
 def health():
+    store_info = store.health_check()
     return jsonify({
-        "status": "ok",
+        "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-"version": "1.5",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "version": "1.6",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "store": store_info,
+        "tracker_leader": TRACKER_IS_LEADER,
     })
 
 
@@ -298,10 +340,10 @@ def health():
 @app.route("/api/flight/status")
 def flight_status():
     """Get flight status from AeroAPI."""
-    flight = request.args.get("flight")
-    date = request.args.get("date")
+    flight = clean_ident(request.args.get("flight", ""))
+    date = clean_date(request.args.get("date", ""))
     if not flight:
-        return jsonify({"error": "Missing 'flight' parameter"}), 400
+        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
 
     args = ["status", "--flight", flight]
     if date:
@@ -314,10 +356,10 @@ def flight_status():
 @app.route("/api/flight/chain")
 def flight_chain():
     """Get equipment chain (inbound flight, tail, turn time)."""
-    flight = request.args.get("flight")
-    date = request.args.get("date")
+    flight = clean_ident(request.args.get("flight", ""))
+    date = clean_date(request.args.get("date", ""))
     if not flight:
-        return jsonify({"error": "Missing 'flight' parameter"}), 400
+        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
 
     args = ["chain", "--flight", flight]
     if date:
@@ -330,10 +372,10 @@ def flight_chain():
 @app.route("/api/flight/track")
 def flight_track():
     """Get real-time aircraft position."""
-    reg = request.args.get("reg")
-    flight = request.args.get("flight")
+    reg = clean_ident(request.args.get("reg", ""))
+    flight = clean_ident(request.args.get("flight", ""))
     if not reg and not flight:
-        return jsonify({"error": "Missing 'reg' or 'flight' parameter"}), 400
+        return jsonify({"error": "Missing or invalid 'reg' or 'flight' parameter"}), 400
 
     args = ["track"]
     if reg:
@@ -520,10 +562,10 @@ def ops_rvr():
 @app.route("/api/ops/atfm")
 def ops_atfm():
     """Infer Eurocontrol ATFM regulation from delay patterns."""
-    flight = request.args.get("flight")
-    date = request.args.get("date")
+    flight = clean_ident(request.args.get("flight", ""))
+    date = clean_date(request.args.get("date", ""))
     if not flight:
-        return jsonify({"error": "Missing 'flight' parameter"}), 400
+        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
 
     args = ["atfm-infer", "--flight", flight]
     if date:
@@ -543,7 +585,11 @@ def _swim_call(feed: str, default_duration: int, airport_required: bool = False,
     airport = clean_ident(request.args.get("airport", ""))
     flight = clean_ident(request.args.get("flight", ""))
     keyword = clean_ident(request.args.get("keyword", ""))
-    duration = clean_duration(request.args.get("duration", ""), default_duration)
+    # Cap at 20s: SWIM_TIMEOUT is 45s and JVM startup + TLS handshake + JMS
+    # teardown eat ~10-15s outside --duration. A user-supplied duration=30
+    # used to reliably outrun the subprocess timeout and 504.
+    duration = clean_duration(request.args.get("duration", ""), default_duration,
+                              hi=20)
 
     if airport_required and not airport:
         return jsonify({
@@ -635,11 +681,20 @@ def check_flight():
         flight = request.args.get("flight")
         date = request.args.get("date")
 
+    flight = clean_ident(flight or "")
+    date = clean_date(date or "")
+
     if not flight:
-        return jsonify({"error": "Missing 'flight' parameter"}), 400
+        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
 
     if not date:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Whole-request budget. Everything below — the phase-1 status fetch and
+    # the merged parallel batch — must land inside this, or the stragglers
+    # come back as per-source 504 entries instead of the request itself
+    # brushing gunicorn's --timeout.
+    deadline = time.monotonic() + CHECK_TIMEOUT
 
     # Normalize flight format: "DL244" → "DL244", but we need airline code
     # for SWIM (DAL244)
@@ -815,11 +870,13 @@ def check_flight():
         "env_extras": chain_env,
     })
 
-    # Run phase 2 in parallel
-    phase2_results = run_scripts_parallel(phase2_tasks, max_workers=8)
-
-    # Also run the airport-independent tasks in parallel
-    swim_results = run_scripts_parallel(tasks, max_workers=4)
+    # Run everything in ONE parallel batch under the whole-request budget.
+    # (These used to be two serialized run_scripts_parallel calls — the
+    # airport-independent SWIM/sigmet tasks waited for all of phase 2 to
+    # finish before even starting, so worst case was 20s + 45s + 45s against
+    # gunicorn's 120s. Keys don't collide across the two lists.)
+    all_results = run_scripts_parallel(phase2_tasks + tasks, max_workers=10,
+                                       deadline=deadline)
 
     # Merge everything into a unified response
     response = {
@@ -833,14 +890,8 @@ def check_flight():
         }
     }
 
-    # Merge phase 2 results
-    for key, result in phase2_results.items():
+    for key, result in all_results.items():
         response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
-
-    # Merge SWIM results
-    for key, result in swim_results.items():
-        if key not in response["data"]:
-            response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
 
     return jsonify(response), 200
 
