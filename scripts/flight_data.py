@@ -143,6 +143,17 @@ def _get_opensky_creds():
 # ---------------------------------------------------------------------------
 # AeroAPI v4
 # ---------------------------------------------------------------------------
+def _q(value) -> str:
+    """URL-quote a value being interpolated into an upstream URL.
+
+    Idents come from request.args and ride into f-string URLs; without
+    quoting, a crafted value like "DL244/route?x=" is path injection — it
+    aims our AeroAPI key at an arbitrary API path on our dime. safe="" also
+    escapes "/" itself.
+    """
+    return urllib.parse.quote(str(value or ""), safe="")
+
+
 def aeroapi_headers():
     key = _get_aeroapi_key()
     if not key: return None
@@ -184,7 +195,7 @@ def aeroapi_flight_status(flight_ident, date=None):
 
     hdrs = aeroapi_headers()
     if not hdrs: return None, "AEROAPI_KEY not set"
-    url = f"{AEROAPI_BASE}/flights/{flight_ident}"
+    url = f"{AEROAPI_BASE}/flights/{_q(flight_ident)}"
     _, data, err = _http_get(url, headers=hdrs)
     if err: return None, f"AeroAPI flights: {err}"
     if not data or "flights" not in data:
@@ -238,14 +249,14 @@ def _parse_aeroapi_flight(f):
 def aeroapi_flight_route(fa_flight_id):
     hdrs = aeroapi_headers()
     if not hdrs: return None, "AEROAPI_KEY not set"
-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}/route", headers=hdrs)
+    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}/route", headers=hdrs)
     if err: return None, f"AeroAPI route: {err}"
     return data, None
 
 def aeroapi_flight_position(fa_flight_id):
     hdrs = aeroapi_headers()
     if not hdrs: return None, "AEROAPI_KEY not set"
-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}/position", headers=hdrs)
+    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}/position", headers=hdrs)
     if err: return None, f"AeroAPI position: {err}"
     if not data: return None, "AeroAPI position: empty response"
     pos = data.get("last_position") or data
@@ -287,7 +298,7 @@ def adsb_by_registration(reg):
     hdrs = adsb_exchange_headers()
     if not hdrs: return None, "ADSB_EXCHANGE_KEY not set"
     reg_clean = reg.strip().upper().replace("-", "")
-    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/registration/{reg_clean}/", headers=hdrs)
+    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/registration/{_q(reg_clean)}/", headers=hdrs)
     if err: return None, f"ADS-B Exchange: {err}"
     ac_list = data.get("ac") if data else None
     if not ac_list: return None, "ADS-B Exchange: no aircraft data"
@@ -296,7 +307,7 @@ def adsb_by_registration(reg):
 def adsb_by_callsign(callsign):
     hdrs = adsb_exchange_headers()
     if not hdrs: return None, "ADSB_EXCHANGE_KEY not set"
-    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/callsign/{callsign.strip().upper()}/", headers=hdrs)
+    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/callsign/{_q(callsign.strip().upper())}/", headers=hdrs)
     if err: return None, f"ADS-B Exchange callsign: {err}"
     ac_list = data.get("ac") if data else None
     if not ac_list: return None, "ADS-B Exchange: no aircraft data for callsign"
@@ -331,7 +342,7 @@ def opensky_headers():
     return {"Accept": "application/json"}
 
 def opensky_by_icao24(icao24):
-    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?icao24={icao24.strip().lower()}",
+    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?icao24={_q(icao24.strip().lower())}",
                              headers=opensky_headers())
     if err: return None, f"OpenSky: {err}"
     states = data.get("states") if data else None
@@ -339,7 +350,7 @@ def opensky_by_icao24(icao24):
     return _parse_opensky_state(states[0]), None
 
 def opensky_by_callsign(callsign):
-    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?callsign={callsign.strip().upper()}",
+    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?callsign={_q(callsign.strip().upper())}",
                              headers=opensky_headers())
     if err: return None, f"OpenSky callsign: {err}"
     states = data.get("states") if data else None
@@ -365,8 +376,13 @@ def cmd_status(args):
     errors = []
     flights, err = aeroapi_flight_status(args.flight, date=args.date)
     if err: errors.append({"source": "aeroapi", "error": err})
+    # Route is a SECOND paid AeroAPI query and nothing downstream uses it —
+    # not analysis.py, not the iOS client. It used to be bought
+    # unconditionally, silently doubling the cost of every status poll,
+    # tracker cycle, and brief. Now opt-in via --with-route; the "route" key
+    # stays in the payload (null) so existing decoders are unaffected.
     route_data = None
-    if flights:
+    if flights and getattr(args, "with_route", False):
         fa_id = flights[0].get("fa_flight_id")
         if fa_id:
             route_data, route_err = aeroapi_flight_route(fa_id)
@@ -450,7 +466,7 @@ def cmd_chain(args):
 def _get_inbound_status(fa_flight_id):
     hdrs = aeroapi_headers()
     if not hdrs: return None, "AEROAPI_KEY not set"
-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}", headers=hdrs)
+    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}", headers=hdrs)
     if err: return None, f"AeroAPI inbound: {err}"
     flights = data.get("flights", []) if data else []
     if not flights:
@@ -498,6 +514,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("status")
     p.add_argument("--flight", required=True); p.add_argument("--date", default=None)
+    p.add_argument("--with-route", action="store_true",
+                   help="Also fetch the filed route (costs one extra AeroAPI query)")
     p = sub.add_parser("track")
     p.add_argument("--reg", default=None); p.add_argument("--flight", default=None)
     p = sub.add_parser("chain")
