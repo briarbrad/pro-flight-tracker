@@ -159,6 +159,27 @@ def aeroapi_headers():
     if not key: return None
     return {"x-apikey": key, "Accept": "application/json"}
 
+def _local_date_of(iso_ts: str, tz_name: str) -> str | None:
+    """Calendar date of an ISO timestamp in the given IANA timezone.
+
+    Falls back to the timestamp's own (UTC) date when the zone is missing or
+    unknown, and None when the timestamp itself won't parse.
+    """
+    if not iso_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            dt = dt.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return dt.strftime("%Y-%m-%d")
+
+
 def _prefetched_flights(flight_ident):
     """Reuse a flight status the caller already paid for.
 
@@ -204,9 +225,24 @@ def aeroapi_flight_status(flight_ident, date=None):
     if not flights: return None, "AeroAPI: no flights found"
     if date:
         target = date if isinstance(date, str) else date.strftime("%Y-%m-%d")
-        filtered = [f for f in flights
-                    if target in (f.get("scheduled_out") or f.get("estimated_out") or "")]
-        if filtered: flights = filtered
+        # Match on the ORIGIN-LOCAL calendar date, not a substring of the UTC
+        # timestamp. A JFK 11 PM EDT departure has scheduled_out on the next
+        # UTC day, so UTC matching resolved evening flights to the wrong leg
+        # (or 404'd the brief). AeroAPI supplies the origin timezone.
+        def _dep_local_date(f):
+            ts = (f.get("scheduled_out") or f.get("estimated_out")
+                  or f.get("scheduled_off") or "")
+            tz = ((f.get("origin") or {}).get("timezone")) or ""
+            return _local_date_of(ts, tz)
+        local_matches = [f for f in flights if _dep_local_date(f) == target]
+        if local_matches:
+            flights = local_matches
+        else:
+            # Fallback: the old UTC-substring behavior, so a caller that was
+            # (correctly or not) passing UTC dates still finds its leg.
+            filtered = [f for f in flights
+                        if target in (f.get("scheduled_out") or f.get("estimated_out") or "")]
+            if filtered: flights = filtered
     return [_parse_aeroapi_flight(f) for f in flights], None
 
 def _parse_aeroapi_flight(f):
