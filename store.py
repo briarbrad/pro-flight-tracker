@@ -52,6 +52,31 @@ def backend_name() -> str:
     return "memory"
 
 
+def health_check() -> dict:
+    """Cheap store liveness probe for /health. Never raises.
+
+    Railway's healthcheck only sees /health, and /health never used to touch
+    the store — so a dead DATABASE_URL passed the healthcheck while tracking
+    silently degraded to in-memory. Surface it here instead.
+    """
+    info = {"backend": backend_name()}
+    if not using_postgres():
+        # In-memory (or psycopg missing): nothing to probe, but make the
+        # degraded mode visible when DATABASE_URL was set and unusable.
+        info["ok"] = not (DATABASE_URL and _psycopg is None)
+        return info
+    try:
+        with _psycopg.connect(DATABASE_URL, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        info["ok"] = True
+    except Exception as exc:
+        info["ok"] = False
+        info["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return info
+
+
 # ---------------------------------------------------------------------------
 # In-memory backend
 # ---------------------------------------------------------------------------
@@ -331,7 +356,8 @@ def acquire_leadership() -> bool:
 
     if using_postgres():
         try:
-            conn = _psycopg.connect(DATABASE_URL, autocommit=True)
+            conn = _psycopg.connect(DATABASE_URL, autocommit=True,
+                                    connect_timeout=5)
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (_LEADER_LOCK_KEY,))
                 got = cur.fetchone()[0]
@@ -340,10 +366,22 @@ def acquire_leadership() -> bool:
                 return True
             conn.close()
             return False
-        except Exception:
-            # Fall through to the file lock rather than leaving the tracker dead.
-            pass
+        except Exception as exc:
+            # Treat a Postgres ERROR as "not leader this round" — NOT as
+            # permission to fall back to the file lock. The flock below is
+            # per-container: during a transient DB blip at deploy time, two
+            # replicas would each win their own local flock and both run the
+            # tracker, double-billing AeroAPI — the exact split-brain leader
+            # election exists to prevent. _watch_for_leadership() retries
+            # every 15s, so leadership is claimed as soon as Postgres is back.
+            import sys as _sys
+            print(f"[STORE] Leadership check failed, will retry: "
+                  f"{type(exc).__name__}: {exc}", file=_sys.stderr)
+            return False
 
+    # File lock: reached only when there is NO Postgres configured at all
+    # (local dev / single container). Cross-worker within one container,
+    # not cross-replica.
     try:
         fh = open(_LEADER_LOCK_FILE, "w")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
