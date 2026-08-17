@@ -151,6 +151,28 @@ CREATE TABLE IF NOT EXISTS edct_cache (
 );
 """
 
+SWIM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS swim_events (
+    id           BIGSERIAL PRIMARY KEY,
+    feed         TEXT NOT NULL,
+    flight       TEXT,
+    airport      TEXT,
+    payload      TEXT NOT NULL,
+    source_ts    TEXT,
+    received_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS swim_events_feed_time
+    ON swim_events (feed, received_at DESC);
+CREATE TABLE IF NOT EXISTS swim_daemon_status (
+    queue_name      TEXT PRIMARY KEY,
+    last_alive_at   TIMESTAMPTZ,
+    last_message_at TIMESTAMPTZ,
+    messages_total  BIGINT NOT NULL DEFAULT 0,
+    restarts        INTEGER NOT NULL DEFAULT 0,
+    note            TEXT
+);
+"""
+
 _COLS = ("track_id, flight, flight_date, push_token, interval_minutes, "
          "last_check, last_risk, created_at, expires_at")
 
@@ -179,6 +201,7 @@ def init() -> None:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
                 cur.execute(EDCT_SCHEMA)
+                cur.execute(SWIM_SCHEMA)
             conn.commit()
     except Exception as exc:
         if "pg_type_typname_nsp_index" in str(exc):
@@ -415,6 +438,17 @@ def get_cached_edct(flight: str, date: str) -> dict | None:
                         "WHERE flight = %s AND flight_date = %s",
                         _edct_key(flight, date))
                     row = cur.fetchone()
+                    if not row:
+                        # Any-date fallback: EDCTs are same-day facts and the
+                        # SWIM daemon keys them by the slot's UTC date, which
+                        # can differ from the client's origin-local date near
+                        # midnight. A FRESH entry for this flight under any
+                        # date is almost certainly today's leg.
+                        cur.execute(
+                            "SELECT payload, updated_at FROM edct_cache "
+                            "WHERE flight = %s ORDER BY updated_at DESC LIMIT 1",
+                            (_edct_key(flight, date)[0],))
+                        row = cur.fetchone()
             if not row:
                 return None
             payload, updated_at = row
@@ -426,11 +460,213 @@ def get_cached_edct(flight: str, date: str) -> dict | None:
             return None
     with _mem_lock:
         entry = _edct_mem.get(_edct_key(flight, date))
+        if not entry:
+            fkey = _edct_key(flight, date)[0]
+            candidates = [(k, e) for k, e in _edct_mem.items() if k[0] == fkey]
+            if candidates:
+                entry = max(candidates, key=lambda kv: _iso(kv[1]["updated_at"]))[1]
     if not entry:
         return None
     if _parse(entry["updated_at"]) < cutoff:
         return None
     return {"payload": dict(entry["payload"]), "cached_at": _iso(entry["updated_at"])}
+
+
+# ---------------------------------------------------------------------------
+# SWIM daemon storage
+#
+# The long-running SWIM consumer (swim_daemon.py, leader process only)
+# parses messages as they arrive and writes them here; request paths read
+# recent events instead of spawning a JVM. Rows are pruned aggressively —
+# this is a rolling window, not an archive.
+# ---------------------------------------------------------------------------
+
+SWIM_EVENT_RETENTION_MINUTES = 60
+SWIM_DAEMON_STALE_SECONDS = 90   # heartbeat older than this = daemon not serving
+
+_swim_mem: dict[str, list] = {}          # feed -> [{payload, flight, airport, received_at}]
+_swim_status_mem: dict[str, dict] = {}
+
+
+def swim_record_events(feed: str, records: list) -> None:
+    """Append parsed SWIM records for a feed. Best-effort, never raises."""
+    if not records:
+        return
+    now = _now()
+    rows = []
+    import json as _json
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        flight = (r.get("flight_id") or r.get("callsign") or "") or None
+        airport = (r.get("airport") or r.get("apt") or "") or None
+        src_ts = (r.get("source_timestamp") or r.get("timestamp") or "") or None
+        rows.append((feed, flight, airport, _json.dumps(r, default=str),
+                     src_ts, now))
+    if not rows:
+        return
+    if using_postgres():
+        try:
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO swim_events "
+                        "(feed, flight, airport, payload, source_ts, received_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)", rows)
+                    cur.execute(
+                        "DELETE FROM swim_events WHERE received_at < %s",
+                        (now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES),))
+                conn.commit()
+            return
+        except Exception:
+            pass
+    with _mem_lock:
+        bucket = _swim_mem.setdefault(feed, [])
+        for feed_, flight, airport, payload, src_ts, ts in rows:
+            bucket.append({"payload": payload, "flight": flight,
+                           "airport": airport, "received_at": ts})
+        cutoff = now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES)
+        _swim_mem[feed] = [e for e in bucket if e["received_at"] >= cutoff][-2000:]
+
+
+def swim_recent_events(feed: str, window_seconds: int = 900,
+                       airport: str = None, flight: str = None,
+                       keyword: str = None, limit: int = 50) -> list:
+    """Recent parsed records for a feed, newest first, filtered.
+
+    Filters mirror the subprocess parsers' semantics loosely: airport
+    matches with and without the K prefix, flight matches space-stripped
+    uppercase, keyword is a case-insensitive substring — all against the
+    stored JSON payload, so fields the per-feed parsers set (flight_id,
+    airport, raw text) are all searchable.
+    """
+    import json as _json
+    cutoff = _now() - timedelta(seconds=window_seconds)
+    raw = []
+    if using_postgres():
+        try:
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload FROM swim_events "
+                        "WHERE feed = %s AND received_at >= %s "
+                        "ORDER BY received_at DESC LIMIT 500",
+                        (feed, cutoff))
+                    raw = [r[0] for r in cur.fetchall()]
+        except Exception:
+            raw = []
+    else:
+        with _mem_lock:
+            raw = [e["payload"] for e in reversed(_swim_mem.get(feed, []))
+                   if e["received_at"] >= cutoff]
+
+    def _match(payload: str) -> bool:
+        up = payload.upper()
+        if airport:
+            a = airport.upper()
+            forms = {a}
+            if len(a) == 4 and a.startswith("K"):
+                forms.add(a[1:])
+            elif len(a) == 3:
+                forms.add("K" + a)
+            if not any(f in up for f in forms):
+                return False
+        if flight:
+            if flight.upper().replace(" ", "") not in up.replace(" ", ""):
+                return False
+        if keyword:
+            if keyword.upper() not in up:
+                return False
+        return True
+
+    out = []
+    for payload in raw:
+        if not _match(payload):
+            continue
+        try:
+            out.append(_json.loads(payload))
+        except (ValueError, TypeError):
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def swim_daemon_heartbeat(queue_name: str, messages_delta: int = 0,
+                          got_message: bool = False, restarted: bool = False,
+                          note: str = None) -> None:
+    """Daemon liveness ping. Best-effort, never raises."""
+    now = _now()
+    if using_postgres():
+        try:
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO swim_daemon_status "
+                        "(queue_name, last_alive_at, last_message_at, "
+                        " messages_total, restarts, note) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (queue_name) DO UPDATE SET "
+                        "last_alive_at = EXCLUDED.last_alive_at, "
+                        "last_message_at = CASE WHEN %s THEN EXCLUDED.last_alive_at "
+                        "                 ELSE swim_daemon_status.last_message_at END, "
+                        "messages_total = swim_daemon_status.messages_total + %s, "
+                        "restarts = swim_daemon_status.restarts + %s, "
+                        "note = COALESCE(%s, swim_daemon_status.note)",
+                        (queue_name, now, now if got_message else None,
+                         messages_delta, 1 if restarted else 0, note,
+                         got_message, messages_delta, 1 if restarted else 0,
+                         note))
+                conn.commit()
+            return
+        except Exception:
+            pass
+    with _mem_lock:
+        s = _swim_status_mem.setdefault(queue_name, {
+            "messages_total": 0, "restarts": 0, "last_message_at": None,
+            "note": None})
+        s["last_alive_at"] = now
+        if got_message:
+            s["last_message_at"] = now
+        s["messages_total"] += messages_delta
+        if restarted:
+            s["restarts"] += 1
+        if note:
+            s["note"] = note
+
+
+def swim_daemon_health(queue_name: str) -> dict:
+    """{"alive": bool, ...} — alive means a recent heartbeat exists."""
+    row = None
+    if using_postgres():
+        try:
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT last_alive_at, last_message_at, messages_total, "
+                        "restarts, note FROM swim_daemon_status "
+                        "WHERE queue_name = %s", (queue_name,))
+                    row = cur.fetchone()
+        except Exception:
+            row = None
+        if row:
+            last_alive, last_msg, total, restarts, note = row
+        else:
+            return {"alive": False}
+    else:
+        with _mem_lock:
+            s = _swim_status_mem.get(queue_name)
+        if not s:
+            return {"alive": False}
+        last_alive, last_msg = s.get("last_alive_at"), s.get("last_message_at")
+        total, restarts, note = s["messages_total"], s["restarts"], s.get("note")
+
+    last_alive = _parse(last_alive)
+    alive = bool(last_alive and
+                 (_now() - last_alive).total_seconds() < SWIM_DAEMON_STALE_SECONDS)
+    return {"alive": alive, "last_alive_at": _iso(last_alive),
+            "last_message_at": _iso(_parse(last_msg)) if last_msg else None,
+            "messages_total": total, "restarts": restarts, "note": note}
 
 
 # ---------------------------------------------------------------------------
