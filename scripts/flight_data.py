@@ -180,7 +180,7 @@ def _local_date_of(iso_ts: str, tz_name: str) -> str | None:
     return dt.strftime("%Y-%m-%d")
 
 
-def _prefetched_flights(flight_ident):
+def _prefetched_flights(flight_ident, raw=None):
     """Reuse a flight status the caller already paid for.
 
     /api/check runs `status` and then `chain` for the same flight, and both
@@ -191,7 +191,7 @@ def _prefetched_flights(flight_ident):
     Returns None when there's nothing usable, so callers fall through to the
     live API.
     """
-    raw = os.environ.get("PFT_PREFETCHED_STATUS", "")
+    raw = raw if raw is not None else os.environ.get("PFT_PREFETCHED_STATUS", "")
     if not raw:
         return None
     try:
@@ -209,8 +209,8 @@ def _prefetched_flights(flight_ident):
     return flights
 
 
-def aeroapi_flight_status(flight_ident, date=None):
-    prefetched = _prefetched_flights(flight_ident)
+def aeroapi_flight_status(flight_ident, date=None, prefetched_raw=None):
+    prefetched = _prefetched_flights(flight_ident, raw=prefetched_raw)
     if prefetched is not None:
         return prefetched, None
 
@@ -305,8 +305,8 @@ def aeroapi_flight_position(fa_flight_id):
         "timestamp": pos.get("timestamp"), "source": "aeroapi",
     }, None
 
-def aeroapi_position_by_ident(flight_ident):
-    flights, err = aeroapi_flight_status(flight_ident)
+def aeroapi_position_by_ident(flight_ident, prefetched_raw=None):
+    flights, err = aeroapi_flight_status(flight_ident, prefetched_raw=prefetched_raw)
     if err or not flights: return None, err or "No flights found"
     active = None
     for f in flights:
@@ -447,7 +447,8 @@ def cmd_track(args):
                 position = pos; break
             if err: errors.append({"source": key, "error": err})
     if not position and flight:
-        pos, err = aeroapi_position_by_ident(flight)
+        pos, err = aeroapi_position_by_ident(
+            flight, prefetched_raw=getattr(args, "prefetched_status", None))
         if pos and pos.get("latitude") is not None: position = pos
         elif err: errors.append({"source": "aeroapi_position", "error": err})
     return {"pull_time": now_utc(), "source": position.get("source") if position else None,
@@ -456,7 +457,8 @@ def cmd_track(args):
 
 def cmd_chain(args):
     errors = []
-    flights, err = aeroapi_flight_status(args.flight, date=args.date)
+    flights, err = aeroapi_flight_status(args.flight, date=args.date,
+                                         prefetched_raw=getattr(args, "prefetched_status", None))
     if err: errors.append({"source": "aeroapi_status", "error": err})
     if not flights:
         return {"pull_time": now_utc(), "source": "aeroapi", "command": "chain",
@@ -544,7 +546,7 @@ def _analyze_turn_time(outbound, inbound, aircraft_type):
             "inbound_ident": inbound.get("ident"), "note": note}
 
 # ---------------------------------------------------------------------------
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(prog="flight_data",
         description="Pro Flight Tracker — flight status, position, equipment chain")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -556,10 +558,27 @@ def main():
     p.add_argument("--reg", default=None); p.add_argument("--flight", default=None)
     p = sub.add_parser("chain")
     p.add_argument("--flight", required=True); p.add_argument("--date", default=None)
+    return parser
+
+
+def dispatch(args) -> dict:
+    """Run a parsed command in-process and return its payload.
+
+    Same output as the CLI, minus the printing — this is what app.py calls
+    when it imports this script as a module instead of spawning it.
+    """
+    if args.command == "track" and not args.reg and not args.flight:
+        return {"error": "track requires --reg or --flight", "command": "track"}
+    return {"status": cmd_status, "track": cmd_track,
+            "chain": cmd_chain}[args.command](args)
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.command == "track" and not args.reg and not args.flight:
         parser.error("track requires --reg or --flight")
-    result = {"status": cmd_status, "track": cmd_track, "chain": cmd_chain}[args.command](args)
+    result = dispatch(args)
     json.dump(result, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
 
