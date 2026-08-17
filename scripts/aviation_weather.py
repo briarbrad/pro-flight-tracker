@@ -895,10 +895,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+def dispatch(args) -> dict:
+    """Run a parsed command in-process and return the CLI's output dict.
 
+    Same payload as the CLI (pull_time + command + result), minus the
+    printing — this is what app.py calls when it imports this script as a
+    module instead of spawning it.
+    """
     pull_time = datetime.now(timezone.utc).isoformat()
 
     if args.command == "metar":
@@ -916,14 +919,24 @@ def main() -> None:
     elif args.command == "brief":
         result = fetch_brief(args.origin, args.dest)
     else:
-        parser.print_help()
-        sys.exit(1)
+        return {"error": f"Unknown command: {args.command!r}"}
 
     output = {
         "pull_time": pull_time,
         "command": args.command,
     }
     output.update(result)
+    return output
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    output = dispatch(args)
+    if output.get("error") and "Unknown command" in str(output.get("error")):
+        parser.print_help()
+        sys.exit(1)
 
     json.dump(output, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
