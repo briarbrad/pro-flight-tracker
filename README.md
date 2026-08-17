@@ -60,7 +60,7 @@ Full reference with response shapes lives in [RORK_BRIEF.md](RORK_BRIEF.md).
 | Airport ops | `/api/ops/gairmet`, `/tcf`, `/lightning`, `/rvr`, `/atfm` | free | 1–20s |
 | FAA SWIM | `/api/swim/{tbfm,sfdps,itws,notams,stdds,tfms-flight,tfms-flow,tfdm}` | free | duration + ~4s |
 | Aggregate | `/api/check` | **AeroAPI** | 30–60s |
-| Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with horizon |
+| Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with phase + horizon |
 | Tracking | `/api/track` (POST/DELETE), `/api/tracked` | **AeroAPI** per interval | instant |
 
 Only the AeroAPI-backed endpoints cost money. Weather, airport ops, and all
@@ -99,7 +99,8 @@ eight SWIM feeds are free to call as often as useful.
 pro-flight-tracker/
 ├── app.py                  Flask API — all endpoints, background tracker
 ├── store.py                Tracking store (Postgres / in-memory) + leader election
-├── analysis.py             Horizon gating, Branch A/B, LLM prompt payload
+├── analysis.py             Flight phase, horizon gating, Branch A/B,
+│                           taxi/position analysis, LLM prompt payload
 ├── Dockerfile              Python 3.12 + Java 25. Copies files BY NAME —
 │                             a new top-level module must be added here
 ├── Procfile                gunicorn process definition

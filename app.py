@@ -286,7 +286,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "pro-flight-tracker",
-"version": "1.4",
+"version": "1.5",
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
@@ -979,9 +979,18 @@ def flight_brief():
     sources["flight_status"] = {"status": "ok", "relevance": "PRIMARY",
                                 "data": primary}
 
-    # --- Step 2: horizon decides everything downstream.
-    horizon = analysis.compute_horizon(primary)
-    plan = analysis.source_plan(horizon["hours_to_departure"])
+    # --- Step 2: phase, then horizon, decide everything downstream.
+    # Phase first: gating on time-to-gate-departure alone meant a flight that
+    # had pushed back but not taken off had every live source switched off,
+    # which is exactly backwards — a 3-hour taxi queue is when EDCT, ground
+    # stops and surface congestion matter most.
+    # One timestamp for the whole brief. Elapsed-taxi, time-to-next-event and
+    # the horizon band all have to agree with each other; recomputing "now"
+    # per call would let them drift apart within a single response.
+    now = datetime.now(timezone.utc)
+    phase = analysis.compute_phase(primary, now)
+    horizon = analysis.compute_horizon(primary, now, phase)
+    plan = analysis.source_plan(horizon["hours_to_next_event"], phase)
 
     origin = primary.get("origin_icao")
     dest = primary.get("dest_icao")
@@ -1024,6 +1033,23 @@ def flight_brief():
     if plan["rvr"]["relevant"] and origin:
         tasks.append({"key": "rvr", "script": "airport_ops.py",
                       "args": ["rvr", "--airport", to_faa(origin)], "timeout": 15})
+    if plan["position"]["relevant"]:
+        # Answers "where is it and is it actually moving" once the aircraft
+        # is out of the gate. ADS-B and OpenSky are free and tried first;
+        # the AeroAPI fallback only fires when both miss, and gets the
+        # prefetched status so it costs one query rather than two.
+        pos_args = ["track", "--flight", flight]
+        if primary.get("registration"):
+            pos_args += ["--reg", primary["registration"]]
+        pos_env = None
+        if isinstance(status_data, dict):
+            try:
+                pos_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
+            except (TypeError, ValueError):
+                pos_env = None
+        tasks.append({"key": "position", "script": "flight_data.py",
+                      "args": pos_args, "timeout": 20,
+                      "env_extras": pos_env})
 
     if tasks:
         for key, result in run_scripts_parallel(tasks, max_workers=6).items():
@@ -1088,13 +1114,31 @@ def flight_brief():
     programs = analysis._programs_from_faa(
         (sources.get("faa_status") or {}).get("data"))
 
+    # Predictions first: the phase's next_event and the TAF windows both key
+    # off them, and they're what carries the EDCT into everything downstream.
+    predictions = analysis.predict_times(primary, edct, horizon,
+                                         origin_tz=origin_tz, dest_tz=dest_tz)
+    phase = analysis.attach_next_event(phase, predictions, origin_tz, dest_tz,
+                                       now)
+
+    # What the aircraft is physically doing, and whether that's abnormal.
+    taxi = analysis.analyze_taxi(primary, phase, predictions, now)
+    position = analysis.describe_position(
+        (sources.get("position") or {}).get("data"), phase)
+
     # Terminal forecast across the actual departure and arrival windows.
     # Beyond ~6h out this is the only source still carrying signal, so it has
     # to reach the verdict — not just the narrative.
+    #
+    # The departure window centres on predicted TAKEOFF, not gate departure:
+    # a flight that pushed back at 23:20 and takes off at 02:28 meets an
+    # entirely different TAF period than the one covering its pushback.
     taf_payload = (sources.get("taf") or {}).get("data")
-    dep_ref = (analysis.parse_iso(primary.get("estimated_out"))
+    dep_ref = (analysis.parse_iso((predictions.get("takeoff") or {}).get("time"))
+               or analysis.parse_iso(primary.get("estimated_out"))
                or analysis.parse_iso(primary.get("scheduled_out")))
-    arr_ref = (analysis.parse_iso(primary.get("estimated_in"))
+    arr_ref = (analysis.parse_iso((predictions.get("gate_arrival") or {}).get("time"))
+               or analysis.parse_iso(primary.get("estimated_in"))
                or analysis.parse_iso(primary.get("scheduled_in")))
     taf_windows = {}
     weather_effects = []
@@ -1115,11 +1159,13 @@ def flight_brief():
 
     branch = analysis.classify_branch(horizon, programs, turn_analysis, plan,
                                       weather_effects)
-    effects = analysis.build_effects(primary, programs, turn_analysis,
-                                     edct, horizon) + weather_effects
-    verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects)
-    predictions = analysis.predict_times(primary, edct, horizon,
-                                         origin_tz=origin_tz, dest_tz=dest_tz)
+    effects = (analysis.build_effects(primary, programs, turn_analysis,
+                                      edct, horizon)
+               + weather_effects
+               + analysis.taxi_effects(taxi, edct)
+               + analysis.position_effects(position, phase))
+    verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects,
+                              taxi, phase)
 
     # Severity order so the client can render top-down without re-sorting.
     _sev = {"ACTION": 0, "WATCH": 1, "INFO": 2}
@@ -1134,19 +1180,36 @@ def flight_brief():
     payload["facts"]["effects"] = effects
     payload["facts"]["predicted_times"] = predictions
     payload["facts"]["taf_windows"] = taf_windows
+    payload["facts"]["phase"] = phase
+    payload["facts"]["taxi"] = taxi
+    payload["facts"]["position"] = position
     payload["guardrails"].append(
         "Predicted gate/takeoff/arrival times and any EDCT are already "
         "computed and included in the facts. Report them with their stated "
         "basis and uncertainty; never derive alternative times.")
-    payload["system"] += ("\n- Predicted gate/takeoff/arrival times and any "
-                          "EDCT are already computed and included in the "
-                          "facts. Report them with their stated basis and "
-                          "uncertainty; never derive alternative times.")
+    payload["guardrails"].append(
+        "`phase` is where the aircraft physically is right now. Write about "
+        "what happens NEXT from that phase — for a taxiing flight the "
+        "question is wheels-up, not pushback. Never describe a flight that "
+        "has left the gate as still waiting to depart, and never call a "
+        "flight 'departed' when it is holding on the ground.")
+    payload["system"] += (
+        "\n- Predicted gate/takeoff/arrival times and any EDCT are already "
+        "computed and included in the facts. Report them with their stated "
+        "basis and uncertainty; never derive alternative times."
+        "\n- `phase` is where the aircraft physically is right now. Write "
+        "about what happens NEXT from that phase — for a taxiing flight the "
+        "question is wheels-up, not pushback. Never describe a flight that "
+        "has left the gate as still waiting to depart, and never call a "
+        "flight 'departed' when it is holding on the ground.")
 
     return jsonify({
         "flight": flight,
         "date": date,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now.isoformat(),
+        "phase": phase,
+        "taxi": taxi,
+        "position": position,
         "horizon": horizon,
         "verdict": verdict,
         "effects": effects,
@@ -1159,6 +1222,7 @@ def flight_brief():
         "sources_excluded": excluded,
         "sources": sources,
         "llm_payload": payload,
+        "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
         "aeroapi_queries_used": aeroapi_queries,
     }), 200
 
@@ -1415,8 +1479,14 @@ def background_tracker():
                 tracked_flights_found = _extract_flights(
                     results.get("flight_status", {}).get("data"))
                 primary = tracked_flights_found[0] if tracked_flights_found else {}
-                horizon = analysis.compute_horizon(primary, now)
-                plan = analysis.source_plan(horizon["hours_to_departure"])
+                # Phase-aware, same as /api/brief: a flight holding on a
+                # taxiway used to fall into the hours<0 branch and have
+                # faa_status gated off, so an active ground stop that was
+                # genuinely holding it went unalerted.
+                tracked_phase = analysis.compute_phase(primary, now)
+                horizon = analysis.compute_horizon(primary, now, tracked_phase)
+                plan = analysis.source_plan(horizon["hours_to_next_event"],
+                                            tracked_phase)
 
                 # Phase 2 — FAA delay programs, but only when they can still
                 # matter at this horizon. Free call, but a misleading one

@@ -54,7 +54,181 @@ BAND_GUIDANCE = {
                 "aircraft positioning, not through today's programs.",
     "DISTANT": "Schedule and base rates only. Almost nothing observable today "
                "constrains this departure.",
+    "ARRIVED": "Flight is complete. Nothing further to assess.",
+    "CANCELLED": "Flight is cancelled. No operational assessment applies.",
 }
+
+
+# ---------------------------------------------------------------------------
+# Flight phase
+#
+# The horizon used to be one-dimensional: hours until gate departure. That
+# breaks the moment an aircraft pushes back, because the clock goes negative
+# and every live source gets gated off — precisely when a flight sitting in a
+# 3-hour taxi queue needs EDCT, ground stops and surface congestion most.
+#
+# Phase fixes that. Each phase has its own clock running to its own next
+# milestone, so "40 minutes from wheels-up while holding on the taxiway" is
+# IMMINENT rather than "departed, nothing to say".
+# ---------------------------------------------------------------------------
+
+# phase -> (label, detail, next event key, next event label)
+PHASE_META = {
+    "PRE_GATE":  ("Before pushback", "Still at the gate",
+                  "gate_departure", "Pushback"),
+    "TAXI_OUT":  ("Taxiing out", "Left the gate, has not taken off",
+                  "takeoff", "Takeoff"),
+    "AIRBORNE":  ("In the air", "Airborne, en route",
+                  "landing", "Landing"),
+    "TAXI_IN":   ("Taxiing in", "Landed, has not reached the gate",
+                  "gate_arrival", "Gate arrival"),
+    "ARRIVED":   ("Arrived", "At the destination gate", None, None),
+    "CANCELLED": ("Cancelled", "Flight is cancelled", None, None),
+}
+
+# Typical taxi-out minutes by airport. These are the baseline a taxi time is
+# judged abnormal against — JFK's 30 is genuinely normal there and would be
+# alarming at DCA. Anything unlisted uses the default.
+TAXI_OUT_TYPICAL_MIN = {
+    "KJFK": 30, "KLGA": 25, "KEWR": 28, "KORD": 22, "KATL": 20,
+    "KBOS": 21, "KPHL": 22, "KDFW": 18, "KIAH": 18, "KCLT": 20,
+    "KDEN": 18, "KLAX": 22, "KSFO": 20, "KSEA": 17, "KMIA": 20,
+    "KDCA": 16, "KIAD": 18, "KMCO": 17, "KLAS": 16, "KPHX": 16,
+    "KMSP": 19, "KDTW": 18, "KSLC": 15, "KBWI": 15, "KMDW": 15,
+    "KFLL": 17, "KTPA": 15, "KSAN": 15, "KPDX": 14, "KAUS": 14,
+    "KBNA": 15, "KSTL": 14, "KMSY": 15, "KPIT": 15, "KCLE": 15,
+    "KRDU": 15, "KSJC": 14, "KOAK": 14, "KSMF": 13, "KHOU": 15,
+    "EGLL": 22, "LFPG": 22, "EHAM": 21, "EDDF": 20, "LIRF": 18,
+}
+TAXI_OUT_TYPICAL_DEFAULT = 17
+TAXI_IN_TYPICAL_MIN = 10
+
+
+def typical_taxi_out(icao: str) -> int:
+    return TAXI_OUT_TYPICAL_MIN.get((icao or "").upper(),
+                                    TAXI_OUT_TYPICAL_DEFAULT)
+
+
+def compute_phase(flight: dict, now: datetime = None) -> dict:
+    """Where the aircraft physically is, and what happens next.
+
+    Derived purely from which actual_* milestones have been filed, which is
+    the only reliable signal — carrier `status` strings vary too much to
+    branch on. The `next_event` here is a first pass built from schedule and
+    airline estimates; `attach_next_event` upgrades it once an EDCT and the
+    full prediction set are known.
+    """
+    now = now or datetime.now(timezone.utc)
+    flight = flight or {}
+
+    act_out = parse_iso(flight.get("actual_out"))
+    act_off = parse_iso(flight.get("actual_off"))
+    act_on = parse_iso(flight.get("actual_on"))
+    act_in = parse_iso(flight.get("actual_in"))
+
+    if flight.get("cancelled"):
+        phase, since = "CANCELLED", None
+    elif act_in:
+        phase, since = "ARRIVED", act_in
+    elif act_on:
+        phase, since = "TAXI_IN", act_on
+    elif act_off:
+        phase, since = "AIRBORNE", act_off
+    elif act_out:
+        phase, since = "TAXI_OUT", act_out
+    else:
+        phase, since = "PRE_GATE", None
+
+    label, detail, next_key, next_label = PHASE_META[phase]
+
+    # First-pass estimate of when the next milestone happens.
+    origin = flight.get("origin_icao")
+    next_time = None
+    next_basis = None
+    if phase == "PRE_GATE":
+        next_time = (parse_iso(flight.get("estimated_out"))
+                     or parse_iso(flight.get("scheduled_out")))
+        next_basis = ("airline estimate"
+                      if flight.get("estimated_out") else "schedule")
+    elif phase == "TAXI_OUT":
+        est_off = parse_iso(flight.get("estimated_off"))
+        if est_off:
+            next_time, next_basis = est_off, "airline/FAA estimate"
+        elif act_out:
+            taxi = typical_taxi_out(origin)
+            next_time = act_out + timedelta(minutes=taxi)
+            next_basis = (f"pushback + {taxi} min typical taxi at "
+                          f"{origin or 'this airport'}")
+    elif phase == "AIRBORNE":
+        next_time = (parse_iso(flight.get("estimated_on"))
+                     or parse_iso(flight.get("scheduled_on")))
+        next_basis = ("airline/FAA estimate"
+                      if flight.get("estimated_on") else "schedule")
+    elif phase == "TAXI_IN":
+        est_in = parse_iso(flight.get("estimated_in"))
+        if est_in:
+            next_time, next_basis = est_in, "airline/FAA estimate"
+        elif act_on:
+            next_time = act_on + timedelta(minutes=TAXI_IN_TYPICAL_MIN)
+            next_basis = f"landing + {TAXI_IN_TYPICAL_MIN} min typical taxi-in"
+
+    elapsed = round((now - since).total_seconds() / 60.0) if since else None
+    to_next = ((next_time - now).total_seconds() / 3600.0
+               if next_time else None)
+
+    return {
+        "phase": phase,
+        "phase_label": label,
+        "phase_detail": detail,
+        "since": since.isoformat() if since else None,
+        "elapsed_in_phase_min": elapsed,
+        "is_terminal": phase in ("ARRIVED", "CANCELLED"),
+        "diverted": bool(flight.get("diverted")),
+        "next_event": next_key,
+        "next_event_label": next_label,
+        "next_event_time": next_time.isoformat() if next_time else None,
+        "next_event_basis": next_basis,
+        "next_event_status": None,
+        "minutes_to_next_event": (round(to_next * 60) if to_next is not None
+                                  else None),
+        "hours_to_next_event": (round(to_next, 2) if to_next is not None
+                                else None),
+        "evaluated_at": now.isoformat(),
+    }
+
+
+def attach_next_event(phase: dict, predictions: dict, origin_tz: str = "",
+                      dest_tz: str = "", now: datetime = None) -> dict:
+    """Upgrade a phase's next_event using the full prediction set.
+
+    compute_phase runs before the EDCT lookup, so its takeoff figure can't
+    know about a controlled wheels-up time. This re-points next_event at the
+    corresponding `predicted_times` entry, which carries the authoritative
+    basis, status and airport-local display.
+    """
+    if not phase or not predictions:
+        return phase
+    key = phase.get("next_event")
+    if not key:
+        return phase
+    pred = predictions.get(key)
+    if not isinstance(pred, dict) or not pred.get("time"):
+        return phase
+
+    now = now or datetime.now(timezone.utc)
+    when = parse_iso(pred["time"])
+    phase = dict(phase)
+    phase["next_event_time"] = pred["time"]
+    phase["next_event_basis"] = pred.get("basis")
+    phase["next_event_status"] = pred.get("status")
+    phase["next_event_local_display"] = pred.get("local_display")
+    phase["next_event_timezone"] = pred.get("timezone")
+    if when:
+        delta_h = (when - now).total_seconds() / 3600.0
+        phase["hours_to_next_event"] = round(delta_h, 2)
+        phase["minutes_to_next_event"] = round(delta_h * 60)
+        phase["next_event_overdue"] = delta_h < 0
+    return phase
 
 # Maximum hours-to-departure at which each source still carries signal.
 # None means always relevant. These thresholds encode the horizon table:
@@ -71,6 +245,8 @@ SOURCE_HORIZON = {
     "gairmet":         (12.0, "Forecast turbulence and icing"),
     "tcf":             (6.0,  "Short-fuse convective forecast driving "
                               "ground stops and reroutes"),
+    "position":        (None, "Live aircraft position and movement state "
+                              "(stopped / taxiing / rolling / airborne)"),
     "metar":           (3.0,  "Current surface observation"),
     "lightning":       (2.0,  "Live strike activity driving ramp closures"),
     "rvr":             (2.0,  "Live runway visual range"),
@@ -101,67 +277,145 @@ def parse_iso(value):
 
 
 def band_for(hours):
+    """Band for hours until the next milestone.
+
+    Negative means that milestone is overdue — a predicted wheels-up time
+    that has come and gone while the aircraft is still on the taxiway. That
+    is the most live state there is, not a finished one, so it clamps to
+    IMMINENT rather than reading as 'departed'.
+    """
     if hours is None:
         return "UNKNOWN"
     if hours < 0:
-        return "DEPARTED"
+        return "IMMINENT"
     for low, high, label in HORIZON_BANDS:
         if hours >= low and (high is None or hours < high):
             return label
     return "DISTANT"
 
 
-def compute_horizon(flight: dict, now: datetime = None) -> dict:
-    """Hours until this flight departs, and which band that puts it in.
+def compute_horizon(flight: dict, now: datetime = None,
+                    phase: dict = None) -> dict:
+    """How far this flight is from its next milestone, and the band for it.
 
-    Prefers the most committed time available: actual > estimated > scheduled.
+    The band is driven by the CURRENT phase's clock, not by gate departure:
+    a flight 40 minutes from wheels-up is IMMINENT whether it is still at the
+    gate or has been on the taxiway for an hour. `hours_to_departure` keeps
+    its original meaning (hours to gate departure, negative once pushed back)
+    so existing callers are unaffected, but it no longer decides gating.
     """
     now = now or datetime.now(timezone.utc)
-    scheduled = parse_iso(flight.get("scheduled_out")) if flight else None
-    estimated = parse_iso(flight.get("estimated_out")) if flight else None
-    actual = parse_iso(flight.get("actual_out")) if flight else None
+    flight = flight or {}
+    phase = phase or compute_phase(flight, now)
+
+    scheduled = parse_iso(flight.get("scheduled_out"))
+    estimated = parse_iso(flight.get("estimated_out"))
+    actual = parse_iso(flight.get("actual_out"))
 
     reference = actual or estimated or scheduled
     hours = None
     if reference:
         hours = (reference - now).total_seconds() / 3600.0
 
+    # The gating clock. Pre-pushback these are the same number; afterwards
+    # the phase clock is the only one that still means anything.
+    gating = phase.get("hours_to_next_event")
+    if gating is None and not phase.get("is_terminal"):
+        gating = hours
+
+    if phase.get("phase") == "CANCELLED":
+        band = "CANCELLED"
+    elif phase.get("phase") == "ARRIVED":
+        band = "ARRIVED"
+    else:
+        band = band_for(gating)
+
     return {
         "hours_to_departure": round(hours, 2) if hours is not None else None,
-        "band": band_for(hours),
-        "band_guidance": BAND_GUIDANCE.get(band_for(hours), ""),
+        "hours_to_next_event": (round(gating, 2) if gating is not None
+                                else None),
+        "gating_basis": (f"{phase.get('next_event_label') or 'next milestone'} "
+                         f"({phase.get('phase_label', '').lower()})"
+                         if phase.get("next_event") else
+                         phase.get("phase_label", "")),
+        "phase": phase.get("phase"),
+        "band": band,
+        "band_guidance": BAND_GUIDANCE.get(band, ""),
         "reference_time": reference.isoformat() if reference else None,
         "reference_basis": ("actual" if actual else
                             "estimated" if estimated else
                             "scheduled" if scheduled else None),
-        "scheduled_out": flight.get("scheduled_out") if flight else None,
+        "scheduled_out": flight.get("scheduled_out"),
         "evaluated_at": now.isoformat(),
     }
 
 
-def source_plan(hours) -> dict:
-    """Decide which sources to consult for this horizon.
+# Sources that stop meaning anything once a flight reaches a given phase,
+# regardless of how close the next milestone is. Suppressing these is not just
+# tidiness: equipment_chain costs AeroAPI queries, and buying the inbound
+# aircraft's history for a flight that already pushed back is pure waste.
+PHASE_SUPPRESSED = {
+    "PRE_GATE": {"position"},
+    "TAXI_OUT": {"equipment_chain"},
+    "AIRBORNE": {"equipment_chain", "rvr", "lightning", "metar"},
+    "TAXI_IN": {"equipment_chain", "rvr", "lightning", "metar", "taf",
+                "faa_status", "tfms_flow", "sigmet", "isigmet", "gairmet",
+                "tcf", "tbfm", "itws"},
+}
+
+_PHASE_SUPPRESS_REASON = {
+    "PRE_GATE": "Aircraft has not pushed back — wherever it is now is not "
+                "yet this flight",
+    "TAXI_OUT": "Aircraft has already pushed back — the turn is complete",
+    "AIRBORNE": "Aircraft is airborne — origin-side conditions no longer "
+                "affect this flight",
+    "TAXI_IN": "Aircraft has landed — only the walk to the gate remains",
+}
+
+
+def source_plan(hours, phase: dict = None) -> dict:
+    """Decide which sources to consult, given the horizon and flight phase.
 
     Returns {source: {"relevant": bool, "reason": str, "provides": str}}.
-    Gating here is what keeps a 15-hour-out flight from being judged on
-    conditions that will have cleared — and it also avoids paying AeroAPI for
-    an equipment chain that isn't knowable yet.
+
+    `hours` is time to the CURRENT phase's next milestone — wheels-up for a
+    taxiing flight, not gate departure. That distinction is the whole point:
+    gating on gate departure meant a flight holding on the taxiway had every
+    live source switched off at the exact moment they mattered most.
+
+    Gating still keeps a 15-hour-out flight from being judged on conditions
+    that will have cleared, and still avoids paying AeroAPI for an equipment
+    chain that isn't knowable yet.
     """
+    phase_name = (phase or {}).get("phase", "PRE_GATE")
+    terminal = (phase or {}).get("is_terminal", False)
+    suppressed = PHASE_SUPPRESSED.get(phase_name, set())
+
+    # An overdue milestone is maximally live, not stale. Clamp so a takeoff
+    # that should already have happened doesn't gate everything off.
+    if hours is not None and hours < 0:
+        hours = 0.0
+
     plan = {}
     for source, (max_hours, provides) in SOURCE_HORIZON.items():
-        if hours is None:
+        if terminal:
+            relevant = source == "flight_status"
+            reason = ("Flight is cancelled" if phase_name == "CANCELLED"
+                      else "Flight has arrived")
+        elif source in suppressed:
+            relevant = False
+            reason = _PHASE_SUPPRESS_REASON.get(phase_name, "Not applicable "
+                                                            "at this phase")
+        elif hours is None:
             relevant = source in ("flight_status", "taf")
             reason = ("Departure time unknown — limited to schedule-independent "
                       "sources") if not relevant else "Safe to consult without a horizon"
-        elif hours < 0:
-            relevant = source == "flight_status"
-            reason = "Flight has already departed"
         elif max_hours is None or hours <= max_hours:
             relevant = True
             reason = f"Within the {max_hours}h useful window" if max_hours else "Always relevant"
         else:
             relevant = False
-            reason = (f"Departure is {hours:.1f}h out; this source stops "
+            reason = (f"Next milestone is {hours:.1f}h out; this source stops "
                       f"carrying signal beyond {max_hours}h")
         plan[source] = {"relevant": relevant, "reason": reason,
                         "provides": provides}
@@ -328,7 +582,8 @@ def classify_branch(horizon: dict, programs: list, turn_analysis: dict,
 
 
 def assess(horizon: dict, branch: dict, turn_analysis: dict,
-           flight: dict, effects: list = None) -> dict:
+           flight: dict, effects: list = None, taxi: dict = None,
+           phase: dict = None) -> dict:
     """Coarse departure-risk verdict plus an honest confidence level.
 
     Confidence is as important as the verdict: at long horizons the correct
@@ -379,6 +634,20 @@ def assess(horizon: dict, branch: dict, turn_analysis: dict,
                 risk = _escalate(risk, "MODERATE")
                 drivers.append(e["cause"])
 
+        # An abnormal taxi-out is a delay that is already happening, not a
+        # forecast one. It escalates because leaving the headline at LOW
+        # while the aircraft sits on a taxiway for two hours is the most
+        # obvious way for this app to lose the user's trust.
+        #
+        # Taxi-IN deliberately does not escalate: the flight has landed, so
+        # "departure risk" no longer describes anything the passenger cares
+        # about. It still surfaces as an effect, because it does affect
+        # connection timing.
+        if (isinstance(taxi, dict) and taxi.get("assessment") == "EXTENDED"
+                and taxi.get("phase") == "TAXI_OUT"):
+            risk = _escalate(risk, "MODERATE")
+            drivers.append(taxi.get("summary") or "Extended taxi in progress.")
+
     # Confidence is driven by horizon, not by how much data we happened to get.
     band = horizon.get("band")
     confidence = {
@@ -387,13 +656,29 @@ def assess(horizon: dict, branch: dict, turn_analysis: dict,
         "SAME_DAY": "MEDIUM",
         "NEXT_DAY": "LOW",
         "DISTANT": "LOW",
-        "DEPARTED": "HIGH",
+        "ARRIVED": "HIGH",
+        "CANCELLED": "HIGH",
+        "DEPARTED": "HIGH",   # legacy band, no longer emitted
         "UNKNOWN": "LOW",
     }.get(band, "LOW")
 
     if not drivers:
-        drivers.append("No delay mechanism identified from the sources "
-                       "relevant at this horizon.")
+        # "No delay mechanism identified" reads as reassurance, which is
+        # wrong mid-flight. Say what is actually true for the phase.
+        phase_name = (phase or {}).get("phase")
+        if phase_name == "TAXI_OUT":
+            drivers.append("Aircraft is taxiing within a normal window for "
+                           "this airport. No additional delay mechanism "
+                           "identified.")
+        elif phase_name == "AIRBORNE":
+            drivers.append("Aircraft is airborne and tracking to its "
+                           "estimate. No delay mechanism in play.")
+        elif phase_name in ("TAXI_IN", "ARRIVED"):
+            drivers.append("Flight is complete or nearly so — nothing "
+                           "further to assess.")
+        else:
+            drivers.append("No delay mechanism identified from the sources "
+                           "relevant at this horizon.")
 
     return {
         "departure_risk": risk,
@@ -712,6 +997,253 @@ def build_effects(flight: dict, programs: list, turn_analysis: dict,
 
 
 # ---------------------------------------------------------------------------
+# Taxi analysis
+#
+# A long taxi is the delay mechanism nothing else in this codebase used to
+# catch. It isn't a program, isn't weather, and isn't equipment — it's the
+# aircraft sitting in a departure queue with the clock running. Judging it
+# needs an airport baseline, because 30 minutes at JFK is a normal Sunday
+# evening and 30 minutes at DCA means something has gone wrong.
+# ---------------------------------------------------------------------------
+
+# elapsed-or-predicted taxi vs the airport's typical, as (ratio, excess_min).
+# BOTH conditions must hold. Ratio alone over-fires against small baselines —
+# a 20-minute taxi-in is double the 10-minute norm and completely routine —
+# while absolute excess alone would flag a normal JFK departure bank.
+_TAXI_EXTENDED = (2.0, 30)
+_TAXI_ELEVATED = (1.4, 12)
+
+
+def analyze_taxi(flight: dict, phase: dict, predictions: dict = None,
+                 now: datetime = None) -> dict:
+    """Judge a taxi-out or taxi-in against what's normal for the airport.
+
+    Uses whichever is larger: minutes already elapsed, or the taxi implied by
+    the predicted next milestone. An aircraft 100 minutes into a taxi whose
+    predicted wheels-up is another 88 minutes out is a 188-minute taxi, and
+    reporting only the 100 understates it.
+    """
+    now = now or datetime.now(timezone.utc)
+    result = {
+        "applicable": False, "phase": (phase or {}).get("phase"),
+        "airport": None, "elapsed_min": None, "typical_min": None,
+        "predicted_total_min": None, "excess_vs_typical_min": None,
+        "assessment": "UNKNOWN", "summary": "",
+    }
+    phase_name = (phase or {}).get("phase")
+    if phase_name not in ("TAXI_OUT", "TAXI_IN"):
+        return result
+
+    flight = flight or {}
+    outbound = phase_name == "TAXI_OUT"
+    airport = (flight.get("origin_icao") if outbound
+               else flight.get("dest_icao")) or ""
+    typical = (typical_taxi_out(airport) if outbound else TAXI_IN_TYPICAL_MIN)
+
+    started = parse_iso(flight.get("actual_out") if outbound
+                        else flight.get("actual_on"))
+    if not started:
+        return result
+    elapsed = round((now - started).total_seconds() / 60.0)
+
+    predicted_total = None
+    pred_key = "takeoff" if outbound else "gate_arrival"
+    pred = (predictions or {}).get(pred_key) or {}
+    pred_time = parse_iso(pred.get("time"))
+    if pred_time:
+        predicted_total = round((pred_time - started).total_seconds() / 60.0)
+
+    governing = max(v for v in (elapsed, predicted_total) if v is not None)
+    excess = governing - typical
+    ratio = (governing / typical) if typical else None
+
+    if ratio is not None and (ratio >= _TAXI_EXTENDED[0]
+                              and excess >= _TAXI_EXTENDED[1]):
+        assessment = "EXTENDED"
+    elif ratio is not None and (ratio >= _TAXI_ELEVATED[0]
+                                and excess >= _TAXI_ELEVATED[1]):
+        assessment = "ELEVATED"
+    else:
+        assessment = "NORMAL"
+
+    word = "taxi-out" if outbound else "taxi-in"
+    if assessment == "NORMAL":
+        summary = (f"{elapsed} min into {word} at {airport}; typical is "
+                   f"about {typical} min. Within normal range.")
+    else:
+        summary = (f"{elapsed} min into {word} at {airport} against a "
+                   f"typical {typical} min")
+        if predicted_total and predicted_total > elapsed:
+            summary += (f", and the predicted total is {predicted_total} min "
+                        f"— roughly {excess} min beyond normal")
+        else:
+            summary += f" — roughly {excess} min beyond normal"
+        summary += "."
+
+    result.update({
+        "applicable": True, "airport": airport, "elapsed_min": elapsed,
+        "typical_min": typical, "predicted_total_min": predicted_total,
+        "excess_vs_typical_min": excess, "assessment": assessment,
+        "summary": summary,
+    })
+    return result
+
+
+# How long a brief stays worth believing, by phase. This is a STALENESS
+# threshold, not a polling instruction — /api/brief costs AeroAPI queries, so
+# the intent is "after this long, show the user a refresh affordance", not
+# "re-run on a timer". A brief run before pushback is worthless 20 minutes
+# into a taxi hold, which is the failure this exists to flag.
+_REFRESH_BY_PHASE = {
+    "TAXI_OUT": 300,      # 5 min — queue position and EDCTs move fast
+    "TAXI_IN": 300,
+    "AIRBORNE": 900,      # 15 min — arrival estimate drifts slowly
+    "ARRIVED": None,
+    "CANCELLED": None,
+}
+_REFRESH_BY_BAND = {
+    "IMMINENT": 300, "NEAR": 900, "SAME_DAY": 1800,
+    "NEXT_DAY": 3600, "DISTANT": 21600, "UNKNOWN": 1800,
+}
+
+
+def refresh_interval(phase: dict = None, horizon: dict = None):
+    """Seconds after which this brief should be treated as stale.
+
+    None means nothing further will change — the flight is finished.
+    """
+    phase_name = (phase or {}).get("phase")
+    if phase_name in _REFRESH_BY_PHASE:
+        return _REFRESH_BY_PHASE[phase_name]
+    return _REFRESH_BY_BAND.get((horizon or {}).get("band"), 1800)
+
+
+def describe_position(track_payload, phase: dict = None) -> dict:
+    """Turn a raw ADS-B/AeroAPI position into what the aircraft is doing.
+
+    Ground speed is the whole signal here. An aircraft stopped on a taxiway
+    and one rolling toward the runway look identical in a lat/lon pair and
+    completely different to a passenger, so the movement state is what gets
+    named. Coordinates pass through untouched for whatever the client wants
+    to plot.
+    """
+    result = {
+        "available": False, "movement": "UNKNOWN", "movement_label": "",
+        "latitude": None, "longitude": None, "groundspeed_kts": None,
+        "altitude_ft": None, "heading": None, "on_ground": None,
+        "source": None, "observed_at": None, "note": "",
+    }
+    if not isinstance(track_payload, dict):
+        result["note"] = "No position data available"
+        return result
+
+    pos = track_payload.get("data")
+    if not isinstance(pos, dict) or pos.get("latitude") is None:
+        result["note"] = ("Aircraft is not currently reporting a position. "
+                          "Surface coverage is patchy at some airports — "
+                          "this is not itself a sign of a problem.")
+        return result
+
+    gs = pos.get("groundspeed_kts")
+    alt = pos.get("altitude_ft")
+    on_ground = pos.get("on_ground")
+    if on_ground is None:
+        on_ground = bool(alt is not None and alt <= 0)
+
+    if not on_ground:
+        movement, label = "AIRBORNE", "Airborne"
+    elif gs is None:
+        movement, label = "ON_GROUND", "On the ground"
+    elif gs < 5:
+        movement, label = "STOPPED", "Stopped on the ground"
+    elif gs < 40:
+        movement, label = "TAXIING", "Taxiing"
+    else:
+        movement, label = "TAKEOFF_ROLL", "On the takeoff roll"
+
+    phase_name = (phase or {}).get("phase")
+    if movement == "STOPPED" and phase_name == "TAXI_OUT":
+        note = ("Holding — the aircraft is stationary on the airport surface, "
+                "typically in a departure queue or a penalty box waiting on "
+                "a release.")
+    elif movement == "TAXIING" and phase_name == "TAXI_OUT":
+        note = "Moving on the surface toward the runway."
+    elif movement == "TAKEOFF_ROLL":
+        note = "Accelerating for departure — wheels-up is seconds away."
+    elif movement == "AIRBORNE":
+        note = (f"Airborne at {alt:,} ft." if isinstance(alt, (int, float))
+                else "Airborne.")
+    else:
+        note = ""
+
+    result.update({
+        "available": True, "movement": movement, "movement_label": label,
+        "latitude": pos.get("latitude"), "longitude": pos.get("longitude"),
+        "groundspeed_kts": gs, "altitude_ft": alt,
+        "heading": pos.get("heading"), "on_ground": bool(on_ground),
+        "source": pos.get("source") or track_payload.get("source"),
+        "observed_at": track_payload.get("pull_time"),
+        "note": note,
+    })
+    return result
+
+
+def position_effects(position: dict, phase: dict = None) -> list:
+    """A stationary aircraft during taxi-out is worth stating outright."""
+    if not isinstance(position, dict) or not position.get("available"):
+        return []
+    if position.get("movement") != "STOPPED":
+        return []
+    if (phase or {}).get("phase") != "TAXI_OUT":
+        return []
+    return [{
+        "cause": "Aircraft is stationary on the airport surface "
+                 f"(ground speed {position.get('groundspeed_kts') or 0:.0f} kts)",
+        "effect": "It is holding rather than moving toward the runway — "
+                  "waiting on a queue position or a release. Movement "
+                  "resuming is the signal that the wait is ending.",
+        "severity": "INFO",
+        "source": "position",
+    }]
+
+
+def taxi_effects(taxi: dict, edct: dict = None) -> list:
+    """Turn a taxi assessment into the effects-list vocabulary."""
+    if not isinstance(taxi, dict) or not taxi.get("applicable"):
+        return []
+    assessment = taxi.get("assessment")
+    if assessment not in ("ELEVATED", "EXTENDED"):
+        return []
+
+    outbound = taxi.get("phase") == "TAXI_OUT"
+    has_edct = bool((edct or {}).get("edct"))
+
+    if outbound:
+        if has_edct:
+            effect = ("The aircraft is holding for its assigned wheels-up "
+                      "slot. This is a controlled wait, not a queue — it will "
+                      "not move earlier than the EDCT no matter how short the "
+                      "line gets.")
+        else:
+            effect = ("The aircraft is out of the gate and in the departure "
+                      "queue. The delay is already being incurred; the "
+                      "remaining question is the runway, not the gate. Doors "
+                      "are closed, so this is not a delay a passenger can act "
+                      "on — it feeds through to arrival time.")
+    else:
+        effect = ("The aircraft is on the ground but has not reached a gate. "
+                  "Usually gate occupancy or a ramp hold; it affects "
+                  "connection timing, not the flight itself.")
+
+    return [{
+        "cause": taxi.get("summary"),
+        "effect": effect,
+        "severity": "ACTION" if assessment == "EXTENDED" else "WATCH",
+        "source": "taxi",
+    }]
+
+
+# ---------------------------------------------------------------------------
 # Predicted times
 # ---------------------------------------------------------------------------
 
@@ -719,7 +1251,8 @@ TAXI_OUT_DEFAULT_MIN = 20  # planning figure when no TFDM taxi estimate exists
 
 UNCERTAINTY_BY_BAND = {
     "IMMINENT": 10, "NEAR": 20, "SAME_DAY": 45,
-    "NEXT_DAY": 90, "DISTANT": None, "DEPARTED": 5, "UNKNOWN": None,
+    "NEXT_DAY": 90, "DISTANT": None, "ARRIVED": 0, "CANCELLED": None,
+    "DEPARTED": 5, "UNKNOWN": None,
 }
 
 

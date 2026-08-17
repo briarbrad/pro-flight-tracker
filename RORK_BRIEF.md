@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.4","timestamp":"..."}
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.5","timestamp":"..."}
 ```
 
 `/health` does **not** touch the database or any upstream API, so a 200 here
@@ -293,23 +293,91 @@ same-day and tied to a specific window. Feeding live conditions to a model for
 a distant departure produces confident, wrong answers. This endpoint excludes
 them explicitly and says so.
 
+### Flight phase — read this before `horizon`
+
+`phase` is where the aircraft physically is right now, derived from which
+`actual_*` milestones have been filed. It is the primary state for the UI:
+everything else, including the horizon band, is computed relative to it.
+
+| `phase` | Meaning | `next_event` |
+|---|---|---|
+| `PRE_GATE` | Still at the gate | `gate_departure` |
+| `TAXI_OUT` | Left the gate, has not taken off | `takeoff` |
+| `AIRBORNE` | In the air | `landing` |
+| `TAXI_IN` | Landed, not yet at a gate | `gate_arrival` |
+| `ARRIVED` | At the destination gate | — |
+| `CANCELLED` | Cancelled | — |
+
+```json
+"phase": {
+  "phase": "TAXI_OUT",
+  "phase_label": "Taxiing out",
+  "phase_detail": "Left the gate, has not taken off",
+  "since": "2026-08-16T23:20:00+00:00",
+  "elapsed_in_phase_min": 100,
+  "is_terminal": false,
+  "diverted": false,
+  "next_event": "takeoff",
+  "next_event_label": "Takeoff",
+  "next_event_time": "2026-08-17T02:28:00+00:00",
+  "next_event_local_display": "10:28 PM EDT",
+  "next_event_basis": "airline/FAA estimate",
+  "next_event_status": "ESTIMATED",
+  "next_event_overdue": false,
+  "minutes_to_next_event": 88
+}
+```
+
+`next_event` names the key in `predicted_times` that describes what happens
+next, so `predicted_times[brief.phase.next_event]` is always the time to lead
+with. `next_event_*` mirrors that entry — including `basis` and `status`, so
+`CONTROLLED` (an FAA-assigned time) still reads differently from `ESTIMATED`.
+
+`next_event_overdue: true` means the predicted time has passed and the
+milestone still hasn't happened — a wheels-up estimate that came and went
+while the aircraft is still on the taxiway. That is a live, worsening state,
+not a completed one.
+
 ### Horizon bands
 
-| Band | Hours out | What carries signal |
+The band is now driven by **time to `next_event`**, not time to gate
+departure. A flight 40 minutes from wheels-up is `IMMINENT` whether it's
+sitting at the gate or has been on a taxiway for an hour.
+
+| Band | Hours to next event | What carries signal |
 |---|---|---|
-| `IMMINENT` | 0–2 | Everything live: surface, metering, RVR, lightning |
+| `IMMINENT` | 0–2 (and anything overdue) | Everything live: surface, metering, RVR, lightning |
 | `NEAR` | 2–6 | Active delay programs, equipment chain |
 | `SAME_DAY` | 6–12 | Equipment chain, terminal forecast |
 | `NEXT_DAY` | 12–24 | Forecast only. Programs will have expired |
 | `DISTANT` | 24+ | Schedule and base rates |
+| `ARRIVED` | — | Flight complete |
+| `CANCELLED` | — | Nothing to assess |
+
+`horizon` carries both clocks. `hours_to_departure` keeps its original
+meaning — hours to *gate* departure, and it goes **negative** once the
+aircraft pushes back. `hours_to_next_event` is the one that drives gating.
+
+> **Breaking-ish change:** the band `DEPARTED` is no longer emitted. It used
+> to appear the moment `actual_out` was set, which meant a flight holding on
+> a taxiway was reported as finished and every live source was switched off.
+> That state is now `phase: "TAXI_OUT"` with a normal live band. If you have
+> a `case "DEPARTED"` branch, it should become a `phase` check.
 
 ### Response
 
 ```json
 {
   "flight": "DL244",
+  "phase": { "...": "see above" },
+  "taxi": { "...": "see below" },
+  "position": { "...": "see below" },
+  "refresh_after_seconds": 300,
   "horizon": {
     "hours_to_departure": 15.0,
+    "hours_to_next_event": 15.0,
+    "gating_basis": "Pushback (before pushback)",
+    "phase": "PRE_GATE",
     "band": "NEXT_DAY",
     "band_guidance": "Forecast-only regime...",
     "reference_basis": "scheduled"
@@ -403,6 +471,78 @@ when the route leaves CONUS. `tcf` is always fetched once origin/dest are
 known and within horizon; its `relevant[]` array is empty (not absent) when no
 convective forecast area intersects the route.
 
+### `taxi` — is this wait abnormal?
+
+Present on every response; `applicable: false` unless the phase is
+`TAXI_OUT` or `TAXI_IN`.
+
+```json
+"taxi": {
+  "applicable": true,
+  "phase": "TAXI_OUT",
+  "airport": "KJFK",
+  "elapsed_min": 100,
+  "typical_min": 30,
+  "predicted_total_min": 188,
+  "excess_vs_typical_min": 158,
+  "assessment": "EXTENDED",
+  "summary": "100 min into taxi-out at KJFK against a typical 30 min, and the predicted total is 188 min — roughly 158 min beyond normal."
+}
+```
+
+`assessment` is `NORMAL` / `ELEVATED` / `EXTENDED` / `UNKNOWN`, judged against
+a **per-airport** baseline — 30 minutes is a routine JFK taxi and would be
+alarming at DCA. `predicted_total_min` is measured to predicted wheels-up, so
+it keeps growing as the estimate slips; `elapsed_min` alone understates a
+hold that isn't over yet.
+
+`summary` is written to be rendered verbatim. An `EXTENDED` taxi-out
+escalates `verdict.departure_risk` to at least `MODERATE` and appears in
+`drivers`. Taxi-*in* deliberately does not escalate — the flight has landed,
+so departure risk no longer describes anything — but it still appears in
+`effects[]` because it affects connection timing.
+
+### `position` — where it is and whether it's moving
+
+Fetched once the aircraft is out of the gate (never `PRE_GATE`, where the
+airframe is still operating someone else's flight). ADS-B and OpenSky are
+tried first and are free; AeroAPI is the fallback.
+
+```json
+"position": {
+  "available": true,
+  "movement": "STOPPED",
+  "movement_label": "Stopped on the ground",
+  "latitude": 40.6398, "longitude": -73.7789,
+  "groundspeed_kts": 0, "altitude_ft": 0, "heading": 132,
+  "on_ground": true,
+  "source": "adsb_exchange",
+  "observed_at": "2026-08-17T01:00:00Z",
+  "note": "Holding — the aircraft is stationary on the airport surface, typically in a departure queue or a penalty box waiting on a release."
+}
+```
+
+`movement` is `STOPPED` / `TAXIING` / `TAKEOFF_ROLL` / `AIRBORNE` /
+`ON_GROUND` / `UNKNOWN`. This is the distinction a lat/lon pair can't make on
+its own: parked in a queue and rolling toward the runway look identical on a
+map and feel completely different to a passenger. `TAKEOFF_ROLL` means
+wheels-up is seconds away.
+
+`available: false` with a `note` means the aircraft isn't reporting a
+position right now. Surface ADS-B coverage is patchy at some airports — treat
+it as missing data, not as a problem with the flight.
+
+### `refresh_after_seconds`
+
+Seconds after which this brief should be considered stale — 300 during a
+taxi, 900 airborne, up to 21600 for a distant departure, and `null` once the
+flight is finished.
+
+**This is a staleness threshold, not a polling interval.** `/api/brief` costs
+AeroAPI queries (§5); use it to decide when to show a refresh affordance or
+mark the brief as aged, not to re-run on a timer. A brief run before pushback
+is worthless 20 minutes into a taxi hold, which is what this exists to catch.
+
 ### Reading the verdict
 
 **`confidence` matters as much as `departure_risk`.** At `NEXT_DAY` or
@@ -423,14 +563,26 @@ yet," not "this flight is fine."
 
 Cheaper than `/api/check`, and it scales down with distance:
 
-| Horizon | AeroAPI queries | Sources consulted |
+| Phase / horizon | AeroAPI queries | Sources consulted |
 |---|---|---|
-| 0–6h | 4 | 8–12 (adds `isigmet` on non-CONUS routes, `tcf` always) |
-| 6–12h | 4 | 7–10 |
-| 12h+ | **2** | 2 |
+| `PRE_GATE`, 0–6h | 4 | 8–12 (adds `isigmet` on non-CONUS routes, `tcf` always) |
+| `PRE_GATE`, 6–12h | 4 | 7–10 |
+| `PRE_GATE`, 12h+ | **2** | 2 |
+| `TAXI_OUT` | **2** (3 if ADS-B misses) | 10–13 |
+| `AIRBORNE` | **2** (3 if ADS-B misses) | 3–5 |
+| `TAXI_IN` | **2** | 2 |
+| `ARRIVED` / `CANCELLED` | **2** | 1 |
 
 The equipment chain is skipped past 12h because the inbound aircraft isn't
-reliably assigned yet — so you don't pay for it.
+reliably assigned yet — so you don't pay for it. It's also skipped in every
+phase from `TAXI_OUT` onward: the aircraft is already out, so the turn it
+describes is finished and buying its history is pure waste. That's why a
+taxiing flight costs 2 queries while consulting *more* live sources than a
+pre-departure one.
+
+The `position` lookup adds one query only when ADS-B **and** OpenSky both
+miss; it reuses the already-paid flight status, so the fallback costs one
+query rather than two.
 
 ### Using `llm_payload`
 
@@ -766,3 +918,14 @@ results[].effective_start / .effective_end
 11. **`tcf`/`gairmet`'s `relevant[]` can be legitimately empty.** No
     convective/turbulence polygons intersecting the route is the common case,
     not a fetch failure — check `risk_level`/`error`, not just array length.
+12. **`horizon.hours_to_departure` goes negative after pushback** and stays
+    negative for the rest of the flight. Gate on `phase` or
+    `hours_to_next_event` instead; a negative number here is not an error.
+13. **The band `DEPARTED` no longer exists.** A pushed-back flight is
+    `phase: "TAXI_OUT"` with a live band. Any branch keyed on `DEPARTED`
+    will silently stop matching.
+14. **`equipment_chain` is absent from `TAXI_OUT` onward** — it appears in
+    `sources_excluded`, not as an error. The turn it describes already
+    happened.
+15. **`taxi.applicable` and `position.available` are both false much of the
+    time** and the keys are always present. Check the flag, not the key.
