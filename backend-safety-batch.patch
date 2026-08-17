@@ -1,0 +1,420 @@
+diff -x __pycache__ -ru pro-flight-tracker-main.orig/app.py pro-flight-tracker-main/app.py
+--- pro-flight-tracker-main.orig/app.py	2026-08-17 16:32:25.533212384 +0000
++++ pro-flight-tracker-main/app.py	2026-08-17 16:35:50.704736801 +0000
+@@ -143,6 +143,23 @@
+     return v if v.replace("-", "").replace("_", "").isalnum() else ""
+ 
+ 
++def clean_date(value: str) -> str:
++    """Validate a YYYY-MM-DD date string. Returns '' for anything else.
++
++    Dates ride into subprocess argv and into AeroAPI result filtering, so
++    anything that isn't a real calendar date is dropped rather than passed
++    through.
++    """
++    v = clean_param(value or "", 10)
++    if not v:
++        return ""
++    try:
++        datetime.strptime(v, "%Y-%m-%d")
++        return v
++    except ValueError:
++        return ""
++
++
+ # ---------------------------------------------------------------------------
+ # Airport code normalization
+ #
+@@ -247,14 +264,20 @@
+     return str(max(lo, min(hi, n)))
+ 
+ 
+-def run_scripts_parallel(tasks: list[dict], max_workers: int = 6) -> dict:
++def run_scripts_parallel(tasks: list[dict], max_workers: int = 6,
++                         deadline: float = None) -> dict:
+     """Run multiple script calls in parallel.
+ 
+     tasks: [{"key": "metar", "script": "aviation_weather.py", "args": [...], "timeout": 15}, ...]
++    deadline: optional time.monotonic() value; results not in by then are
++        returned as 504 "budget exceeded" entries instead of blocking the
++        request. (The underlying subprocesses still die on their own
++        per-script timeouts; we just stop waiting for them.)
+     Returns: {"key": {result_json}, ...}
+     """
+     results = {}
+-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
++    pool = ThreadPoolExecutor(max_workers=max_workers)
++    try:
+         futures = {}
+         for task in tasks:
+             fut = pool.submit(
+@@ -266,13 +289,29 @@
+             )
+             futures[fut] = task["key"]
+ 
+-        for fut in as_completed(futures):
+-            key = futures[fut]
+-            try:
+-                data, status = fut.result()
+-                results[key] = {"data": data, "status": status}
+-            except Exception as e:
+-                results[key] = {"data": {"error": str(e)}, "status": 500}
++        remaining = None
++        if deadline is not None:
++            remaining = max(0.5, deadline - time.monotonic())
++        try:
++            for fut in as_completed(futures, timeout=remaining):
++                key = futures[fut]
++                try:
++                    data, status = fut.result()
++                    results[key] = {"data": data, "status": status}
++                except Exception as e:
++                    results[key] = {"data": {"error": str(e)}, "status": 500}
++        except TimeoutError:
++            for fut, key in futures.items():
++                if key not in results:
++                    fut.cancel()
++                    results[key] = {
++                        "data": {"error": "Skipped — request time budget exceeded"},
++                        "status": 504,
++                    }
++    finally:
++        # Don't block the response on threads still babysitting slow
++        # subprocesses; they exit when their own timeouts fire.
++        pool.shutdown(wait=deadline is None, cancel_futures=True)
+ 
+     return results
+ 
+@@ -283,11 +322,14 @@
+ 
+ @app.route("/health")
+ def health():
++    store_info = store.health_check()
+     return jsonify({
+-        "status": "ok",
++        "status": "ok" if store_info.get("ok") else "degraded",
+         "service": "pro-flight-tracker",
+-"version": "1.5",
+-        "timestamp": datetime.now(timezone.utc).isoformat()
++        "version": "1.6",
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "store": store_info,
++        "tracker_leader": TRACKER_IS_LEADER,
+     })
+ 
+ 
+@@ -298,10 +340,10 @@
+ @app.route("/api/flight/status")
+ def flight_status():
+     """Get flight status from AeroAPI."""
+-    flight = request.args.get("flight")
+-    date = request.args.get("date")
++    flight = clean_ident(request.args.get("flight", ""))
++    date = clean_date(request.args.get("date", ""))
+     if not flight:
+-        return jsonify({"error": "Missing 'flight' parameter"}), 400
++        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
+ 
+     args = ["status", "--flight", flight]
+     if date:
+@@ -314,10 +356,10 @@
+ @app.route("/api/flight/chain")
+ def flight_chain():
+     """Get equipment chain (inbound flight, tail, turn time)."""
+-    flight = request.args.get("flight")
+-    date = request.args.get("date")
++    flight = clean_ident(request.args.get("flight", ""))
++    date = clean_date(request.args.get("date", ""))
+     if not flight:
+-        return jsonify({"error": "Missing 'flight' parameter"}), 400
++        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
+ 
+     args = ["chain", "--flight", flight]
+     if date:
+@@ -330,10 +372,10 @@
+ @app.route("/api/flight/track")
+ def flight_track():
+     """Get real-time aircraft position."""
+-    reg = request.args.get("reg")
+-    flight = request.args.get("flight")
++    reg = clean_ident(request.args.get("reg", ""))
++    flight = clean_ident(request.args.get("flight", ""))
+     if not reg and not flight:
+-        return jsonify({"error": "Missing 'reg' or 'flight' parameter"}), 400
++        return jsonify({"error": "Missing or invalid 'reg' or 'flight' parameter"}), 400
+ 
+     args = ["track"]
+     if reg:
+@@ -520,10 +562,10 @@
+ @app.route("/api/ops/atfm")
+ def ops_atfm():
+     """Infer Eurocontrol ATFM regulation from delay patterns."""
+-    flight = request.args.get("flight")
+-    date = request.args.get("date")
++    flight = clean_ident(request.args.get("flight", ""))
++    date = clean_date(request.args.get("date", ""))
+     if not flight:
+-        return jsonify({"error": "Missing 'flight' parameter"}), 400
++        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
+ 
+     args = ["atfm-infer", "--flight", flight]
+     if date:
+@@ -543,7 +585,11 @@
+     airport = clean_ident(request.args.get("airport", ""))
+     flight = clean_ident(request.args.get("flight", ""))
+     keyword = clean_ident(request.args.get("keyword", ""))
+-    duration = clean_duration(request.args.get("duration", ""), default_duration)
++    # Cap at 20s: SWIM_TIMEOUT is 45s and JVM startup + TLS handshake + JMS
++    # teardown eat ~10-15s outside --duration. A user-supplied duration=30
++    # used to reliably outrun the subprocess timeout and 504.
++    duration = clean_duration(request.args.get("duration", ""), default_duration,
++                              hi=20)
+ 
+     if airport_required and not airport:
+         return jsonify({
+@@ -635,12 +681,21 @@
+         flight = request.args.get("flight")
+         date = request.args.get("date")
+ 
++    flight = clean_ident(flight or "")
++    date = clean_date(date or "")
++
+     if not flight:
+-        return jsonify({"error": "Missing 'flight' parameter"}), 400
++        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
+ 
+     if not date:
+         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+ 
++    # Whole-request budget. Everything below — the phase-1 status fetch and
++    # the merged parallel batch — must land inside this, or the stragglers
++    # come back as per-source 504 entries instead of the request itself
++    # brushing gunicorn's --timeout.
++    deadline = time.monotonic() + CHECK_TIMEOUT
++
+     # Normalize flight format: "DL244" → "DL244", but we need airline code
+     # for SWIM (DAL244)
+     airline_prefix = flight[:2].upper()
+@@ -815,11 +870,13 @@
+         "env_extras": chain_env,
+     })
+ 
+-    # Run phase 2 in parallel
+-    phase2_results = run_scripts_parallel(phase2_tasks, max_workers=8)
+-
+-    # Also run the airport-independent tasks in parallel
+-    swim_results = run_scripts_parallel(tasks, max_workers=4)
++    # Run everything in ONE parallel batch under the whole-request budget.
++    # (These used to be two serialized run_scripts_parallel calls — the
++    # airport-independent SWIM/sigmet tasks waited for all of phase 2 to
++    # finish before even starting, so worst case was 20s + 45s + 45s against
++    # gunicorn's 120s. Keys don't collide across the two lists.)
++    all_results = run_scripts_parallel(phase2_tasks + tasks, max_workers=10,
++                                       deadline=deadline)
+ 
+     # Merge everything into a unified response
+     response = {
+@@ -833,15 +890,9 @@
+         }
+     }
+ 
+-    # Merge phase 2 results
+-    for key, result in phase2_results.items():
++    for key, result in all_results.items():
+         response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
+ 
+-    # Merge SWIM results
+-    for key, result in swim_results.items():
+-        if key not in response["data"]:
+-            response["data"][key] = result["data"] if result["status"] == 200 else {"error": result["data"]}
+-
+     return jsonify(response), 200
+ 
+ 
+diff -x __pycache__ -ru pro-flight-tracker-main.orig/scripts/flight_data.py pro-flight-tracker-main/scripts/flight_data.py
+--- pro-flight-tracker-main.orig/scripts/flight_data.py	2026-08-17 16:32:25.533122484 +0000
++++ pro-flight-tracker-main/scripts/flight_data.py	2026-08-17 16:36:15.330856022 +0000
+@@ -143,6 +143,17 @@
+ # ---------------------------------------------------------------------------
+ # AeroAPI v4
+ # ---------------------------------------------------------------------------
++def _q(value) -> str:
++    """URL-quote a value being interpolated into an upstream URL.
++
++    Idents come from request.args and ride into f-string URLs; without
++    quoting, a crafted value like "DL244/route?x=" is path injection — it
++    aims our AeroAPI key at an arbitrary API path on our dime. safe="" also
++    escapes "/" itself.
++    """
++    return urllib.parse.quote(str(value or ""), safe="")
++
++
+ def aeroapi_headers():
+     key = _get_aeroapi_key()
+     if not key: return None
+@@ -184,7 +195,7 @@
+ 
+     hdrs = aeroapi_headers()
+     if not hdrs: return None, "AEROAPI_KEY not set"
+-    url = f"{AEROAPI_BASE}/flights/{flight_ident}"
++    url = f"{AEROAPI_BASE}/flights/{_q(flight_ident)}"
+     _, data, err = _http_get(url, headers=hdrs)
+     if err: return None, f"AeroAPI flights: {err}"
+     if not data or "flights" not in data:
+@@ -238,14 +249,14 @@
+ def aeroapi_flight_route(fa_flight_id):
+     hdrs = aeroapi_headers()
+     if not hdrs: return None, "AEROAPI_KEY not set"
+-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}/route", headers=hdrs)
++    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}/route", headers=hdrs)
+     if err: return None, f"AeroAPI route: {err}"
+     return data, None
+ 
+ def aeroapi_flight_position(fa_flight_id):
+     hdrs = aeroapi_headers()
+     if not hdrs: return None, "AEROAPI_KEY not set"
+-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}/position", headers=hdrs)
++    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}/position", headers=hdrs)
+     if err: return None, f"AeroAPI position: {err}"
+     if not data: return None, "AeroAPI position: empty response"
+     pos = data.get("last_position") or data
+@@ -287,7 +298,7 @@
+     hdrs = adsb_exchange_headers()
+     if not hdrs: return None, "ADSB_EXCHANGE_KEY not set"
+     reg_clean = reg.strip().upper().replace("-", "")
+-    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/registration/{reg_clean}/", headers=hdrs)
++    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/registration/{_q(reg_clean)}/", headers=hdrs)
+     if err: return None, f"ADS-B Exchange: {err}"
+     ac_list = data.get("ac") if data else None
+     if not ac_list: return None, "ADS-B Exchange: no aircraft data"
+@@ -296,7 +307,7 @@
+ def adsb_by_callsign(callsign):
+     hdrs = adsb_exchange_headers()
+     if not hdrs: return None, "ADSB_EXCHANGE_KEY not set"
+-    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/callsign/{callsign.strip().upper()}/", headers=hdrs)
++    _, data, err = _http_get(f"{ADSB_EXCHANGE_BASE}/v2/callsign/{_q(callsign.strip().upper())}/", headers=hdrs)
+     if err: return None, f"ADS-B Exchange callsign: {err}"
+     ac_list = data.get("ac") if data else None
+     if not ac_list: return None, "ADS-B Exchange: no aircraft data for callsign"
+@@ -331,7 +342,7 @@
+     return {"Accept": "application/json"}
+ 
+ def opensky_by_icao24(icao24):
+-    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?icao24={icao24.strip().lower()}",
++    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?icao24={_q(icao24.strip().lower())}",
+                              headers=opensky_headers())
+     if err: return None, f"OpenSky: {err}"
+     states = data.get("states") if data else None
+@@ -339,7 +350,7 @@
+     return _parse_opensky_state(states[0]), None
+ 
+ def opensky_by_callsign(callsign):
+-    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?callsign={callsign.strip().upper()}",
++    _, data, err = _http_get(f"{OPENSKY_BASE}/states/all?callsign={_q(callsign.strip().upper())}",
+                              headers=opensky_headers())
+     if err: return None, f"OpenSky callsign: {err}"
+     states = data.get("states") if data else None
+@@ -365,8 +376,13 @@
+     errors = []
+     flights, err = aeroapi_flight_status(args.flight, date=args.date)
+     if err: errors.append({"source": "aeroapi", "error": err})
++    # Route is a SECOND paid AeroAPI query and nothing downstream uses it —
++    # not analysis.py, not the iOS client. It used to be bought
++    # unconditionally, silently doubling the cost of every status poll,
++    # tracker cycle, and brief. Now opt-in via --with-route; the "route" key
++    # stays in the payload (null) so existing decoders are unaffected.
+     route_data = None
+-    if flights:
++    if flights and getattr(args, "with_route", False):
+         fa_id = flights[0].get("fa_flight_id")
+         if fa_id:
+             route_data, route_err = aeroapi_flight_route(fa_id)
+@@ -450,7 +466,7 @@
+ def _get_inbound_status(fa_flight_id):
+     hdrs = aeroapi_headers()
+     if not hdrs: return None, "AEROAPI_KEY not set"
+-    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{fa_flight_id}", headers=hdrs)
++    _, data, err = _http_get(f"{AEROAPI_BASE}/flights/{_q(fa_flight_id)}", headers=hdrs)
+     if err: return None, f"AeroAPI inbound: {err}"
+     flights = data.get("flights", []) if data else []
+     if not flights:
+@@ -498,6 +514,8 @@
+     sub = parser.add_subparsers(dest="command", required=True)
+     p = sub.add_parser("status")
+     p.add_argument("--flight", required=True); p.add_argument("--date", default=None)
++    p.add_argument("--with-route", action="store_true",
++                   help="Also fetch the filed route (costs one extra AeroAPI query)")
+     p = sub.add_parser("track")
+     p.add_argument("--reg", default=None); p.add_argument("--flight", default=None)
+     p = sub.add_parser("chain")
+diff -x __pycache__ -ru pro-flight-tracker-main.orig/store.py pro-flight-tracker-main/store.py
+--- pro-flight-tracker-main.orig/store.py	2026-08-17 16:32:25.496791456 +0000
++++ pro-flight-tracker-main/store.py	2026-08-17 16:35:44.620101798 +0000
+@@ -52,6 +52,31 @@
+     return "memory"
+ 
+ 
++def health_check() -> dict:
++    """Cheap store liveness probe for /health. Never raises.
++
++    Railway's healthcheck only sees /health, and /health never used to touch
++    the store — so a dead DATABASE_URL passed the healthcheck while tracking
++    silently degraded to in-memory. Surface it here instead.
++    """
++    info = {"backend": backend_name()}
++    if not using_postgres():
++        # In-memory (or psycopg missing): nothing to probe, but make the
++        # degraded mode visible when DATABASE_URL was set and unusable.
++        info["ok"] = not (DATABASE_URL and _psycopg is None)
++        return info
++    try:
++        with _psycopg.connect(DATABASE_URL, connect_timeout=3) as conn:
++            with conn.cursor() as cur:
++                cur.execute("SELECT 1")
++                cur.fetchone()
++        info["ok"] = True
++    except Exception as exc:
++        info["ok"] = False
++        info["error"] = f"{type(exc).__name__}: {exc}"[:200]
++    return info
++
++
+ # ---------------------------------------------------------------------------
+ # In-memory backend
+ # ---------------------------------------------------------------------------
+@@ -331,7 +356,8 @@
+ 
+     if using_postgres():
+         try:
+-            conn = _psycopg.connect(DATABASE_URL, autocommit=True)
++            conn = _psycopg.connect(DATABASE_URL, autocommit=True,
++                                    connect_timeout=5)
+             with conn.cursor() as cur:
+                 cur.execute("SELECT pg_try_advisory_lock(%s)", (_LEADER_LOCK_KEY,))
+                 got = cur.fetchone()[0]
+@@ -340,10 +366,22 @@
+                 return True
+             conn.close()
+             return False
+-        except Exception:
+-            # Fall through to the file lock rather than leaving the tracker dead.
+-            pass
++        except Exception as exc:
++            # Treat a Postgres ERROR as "not leader this round" — NOT as
++            # permission to fall back to the file lock. The flock below is
++            # per-container: during a transient DB blip at deploy time, two
++            # replicas would each win their own local flock and both run the
++            # tracker, double-billing AeroAPI — the exact split-brain leader
++            # election exists to prevent. _watch_for_leadership() retries
++            # every 15s, so leadership is claimed as soon as Postgres is back.
++            import sys as _sys
++            print(f"[STORE] Leadership check failed, will retry: "
++                  f"{type(exc).__name__}: {exc}", file=_sys.stderr)
++            return False
+ 
++    # File lock: reached only when there is NO Postgres configured at all
++    # (local dev / single container). Cross-worker within one container,
++    # not cross-replica.
+     try:
+         fh = open(_LEADER_LOCK_FILE, "w")
+         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
