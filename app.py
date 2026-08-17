@@ -328,7 +328,88 @@ def _execute(script: str, args: list, timeout: int,
     module = _INPROC_MODULES.get(script)
     if module is not None:
         return _run_inprocess(module, script, args, timeout, env_extras)
+    if script == "swim_consumer.py":
+        served = _swim_daemon_serve(args)
+        if served is not None:
+            return served, 200
     return _run_subprocess(script, args, timeout, env_extras)
+
+
+# --- SWIM daemon read path --------------------------------------------------
+#
+# When the long-running consumer (swim_daemon.py, leader process) has a
+# recent heartbeat for a queue, SWIM requests are answered from its stored
+# events instead of spawning a JVM: same "results" shape the subprocess
+# prints, ~0ms instead of 10-45s — and no queue competition, which is what
+# used to let two overlapping requests each see half the message stream.
+# Falls back to the subprocess automatically whenever the daemon is down
+# (local dev, JVM crash-looping, non-daemon queues like tbfm/notams).
+
+# Feeds -> config queue names, mirrored from swim_consumer.FEED_QUEUE_MAP
+# (import kept lazy: swim_consumer pulls in nothing heavy, but the daemon
+# module owns the parser bindings).
+_SWIM_FEED_TO_QUEUE = {
+    "tbfm": "tbfm", "itws": "itws", "notams": "notams", "sfdps": "sfdps",
+    "stdds": "stdds", "tfms-flight": "tfms", "tfms-flow": "tfms",
+    "tfdm": "tfdm",
+}
+
+# How far back a daemon-served window reaches. Generous compared with the
+# 8-18s subprocess capture windows — the daemon has been listening the
+# whole time, which is the point.
+_SWIM_SERVE_WINDOW_SECONDS = 900
+
+
+def _swim_argv_to_query(args: list) -> dict:
+    """["tfms-flight","--flight","DAL5187","--duration","8"] -> fields."""
+    q = {"feed": str(args[0]) if args else "", "airport": None,
+         "flight": None, "keyword": None, "limit": 50}
+    i = 1
+    while i < len(args):
+        a, val = str(args[i]), (str(args[i + 1]) if i + 1 < len(args) else None)
+        if a in ("--airport", "-a"):
+            q["airport"] = val; i += 2
+        elif a in ("--flight", "-f"):
+            q["flight"] = val; i += 2
+        elif a in ("--keyword", "-k"):
+            q["keyword"] = val; i += 2
+        elif a in ("--limit", "-n") and val and val.isdigit():
+            q["limit"] = int(val); i += 2
+        else:
+            i += 2 if val and not val.startswith("-") else 1
+    return q
+
+
+def _swim_daemon_serve(args: list):
+    """Answer a SWIM request from daemon-collected events, or None."""
+    q = _swim_argv_to_query(args)
+    queue_name = _SWIM_FEED_TO_QUEUE.get(q["feed"])
+    if not queue_name:
+        return None
+    try:
+        health = store.swim_daemon_health(queue_name)
+    except Exception:
+        return None
+    if not health.get("alive"):
+        return None
+
+    results = store.swim_recent_events(
+        q["feed"], window_seconds=_SWIM_SERVE_WINDOW_SECONDS,
+        airport=q["airport"], flight=q["flight"], keyword=q["keyword"],
+        limit=q["limit"])
+    return {
+        "feed": q["feed"],
+        "query": {"airport": q["airport"], "flight": q["flight"],
+                  "duration_seconds": None},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "served_from": "daemon",
+        "window_seconds": _SWIM_SERVE_WINDOW_SECONDS,
+        "daemon_last_message_at": health.get("last_message_at"),
+        "total_raw_messages": health.get("messages_total"),
+        "filtered_results": len(results),
+        "results": results,
+    }
 
 
 # --- TTL cache --------------------------------------------------------------
@@ -758,12 +839,14 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.7",
+        "version": "1.8",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
         "cache_entries": cache_entries,
         "breakers": _breaker_states(),
+        "swim_daemon": {q: store.swim_daemon_health(q)
+                        for q in ("tfms", "itws")},
     })
 
 
@@ -2240,6 +2323,16 @@ def _become_leader() -> None:
     TRACKER_IS_LEADER = True
     print(f"[TRACKER] Background flight tracker started "
           f"(pid={os.getpid()}, store={store.backend_name()})", file=sys.stderr)
+
+    # The persistent SWIM consumer rides the same leadership: exactly one
+    # process cluster-wide holds the JMS connections, so request-path
+    # fallbacks never compete with it for queue messages.
+    try:
+        import swim_daemon
+        swim_daemon.start(airline_map=_AIRLINE_MAP)
+    except Exception as exc:
+        print(f"[TRACKER] SWIM daemon failed to start: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def _watch_for_leadership(poll_seconds: int = 15) -> None:
