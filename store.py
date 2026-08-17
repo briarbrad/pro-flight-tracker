@@ -141,6 +141,16 @@ CREATE TABLE IF NOT EXISTS tracked_flights (
 );
 """
 
+EDCT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS edct_cache (
+    flight       TEXT NOT NULL,
+    flight_date  TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (flight, flight_date)
+);
+"""
+
 _COLS = ("track_id, flight, flight_date, push_token, interval_minutes, "
          "last_check, last_risk, created_at, expires_at")
 
@@ -168,6 +178,7 @@ def init() -> None:
         with _psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
+                cur.execute(EDCT_SCHEMA)
             conn.commit()
     except Exception as exc:
         if "pg_type_typname_nsp_index" in str(exc):
@@ -335,6 +346,91 @@ def purge_expired(now: datetime = None) -> int:
         for tid in stale:
             del _mem[tid]
         return len(stale)
+
+
+# ---------------------------------------------------------------------------
+# EDCT cache
+#
+# EDCTs (FAA-assigned wheels-up slots) are discovered by the expensive
+# /api/brief SWIM lookup. The cheap /api/flight/live endpoint can't afford
+# that lookup on every refresh, but a slot assigned 20 minutes ago is still
+# the controlling fact — so the brief caches what it finds here and /live
+# re-attaches it with ?edct=cached. Entries go stale fast (traffic management
+# revises slots), hence the short TTL.
+# ---------------------------------------------------------------------------
+
+EDCT_TTL_MINUTES = 45
+
+_edct_mem: dict[tuple, dict] = {}
+
+
+def _edct_key(flight: str, date: str) -> tuple:
+    return ((flight or "").upper(), date or "")
+
+
+def cache_edct(flight: str, date: str, edct: dict) -> None:
+    """Persist an EDCT found by the brief. Empty/None edct is ignored.
+
+    Best-effort: a failure here must never break the brief response.
+    """
+    if not edct or not edct.get("edct"):
+        return
+    now = _now()
+    if using_postgres():
+        try:
+            import json as _json
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(EDCT_SCHEMA)  # lazy-create: non-leader workers
+                    cur.execute(
+                        "INSERT INTO edct_cache (flight, flight_date, payload, updated_at) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (flight, flight_date) DO UPDATE "
+                        "SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+                        (_edct_key(flight, date)[0], date, _json.dumps(edct), now))
+                conn.commit()
+            return
+        except Exception:
+            pass  # fall through to memory so at least this worker remembers
+    with _mem_lock:
+        _edct_mem[_edct_key(flight, date)] = {"payload": dict(edct),
+                                              "updated_at": now}
+
+
+def get_cached_edct(flight: str, date: str) -> dict | None:
+    """Return {"payload": {...}, "cached_at": iso} if a fresh entry exists.
+
+    Entries older than EDCT_TTL_MINUTES are treated as absent — a revised or
+    expired slot is worse than no slot, because predict_times would present
+    it as the authoritative wheels-up time.
+    """
+    cutoff = _now() - timedelta(minutes=EDCT_TTL_MINUTES)
+    if using_postgres():
+        try:
+            import json as _json
+            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload, updated_at FROM edct_cache "
+                        "WHERE flight = %s AND flight_date = %s",
+                        _edct_key(flight, date))
+                    row = cur.fetchone()
+            if not row:
+                return None
+            payload, updated_at = row
+            updated_at = _parse(updated_at)
+            if not updated_at or updated_at < cutoff:
+                return None
+            return {"payload": _json.loads(payload), "cached_at": _iso(updated_at)}
+        except Exception:
+            return None
+    with _mem_lock:
+        entry = _edct_mem.get(_edct_key(flight, date))
+    if not entry:
+        return None
+    if _parse(entry["updated_at"]) < cutoff:
+        return None
+    return {"payload": dict(entry["payload"]), "cached_at": _iso(entry["updated_at"])}
 
 
 # ---------------------------------------------------------------------------
