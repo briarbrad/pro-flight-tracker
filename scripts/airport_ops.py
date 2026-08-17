@@ -360,8 +360,7 @@ def cmd_gairmet(args):
         result["total_active"] = len(all_items)
         result["items"] = all_items
 
-    json.dump(result, sys.stdout, indent=2)
-    print()
+    return result
 
 
 # =========================================================================
@@ -452,9 +451,7 @@ def cmd_tcf(args):
 
     if isinstance(fc, dict) and fc.get("error"):
         result["error"] = fc["error"]
-        json.dump(result, sys.stdout, indent=2)
-        print()
-        return
+        return result
 
     features = fc.get("features", []) if isinstance(fc, dict) else []
     result["issue_time"] = fc.get("issueTime") if isinstance(fc, dict) else None
@@ -495,8 +492,7 @@ def cmd_tcf(args):
             for f in features
         ]
 
-    json.dump(result, sys.stdout, indent=2)
-    print()
+    return result
 
 
 # =========================================================================
@@ -546,16 +542,13 @@ async def _collect_strikes(lat, lon, radius_nm, duration_sec):
 
 def cmd_lightning(args):
     if not HAS_WEBSOCKETS:
-        json.dump({"error": "websockets not installed (pip install websockets)",
-                    "source": "Blitzortung"}, sys.stdout, indent=2)
-        print(); return
+        return {"error": "websockets not installed (pip install websockets)",
+                "source": "Blitzortung"}
 
     icao = args.icao.upper()
     coords = AIRPORT_COORDS.get(icao)
     if not coords:
-        json.dump({"error": f"No coordinates for {icao}. Add to AIRPORT_COORDS."},
-                   sys.stdout, indent=2)
-        print(); return
+        return {"error": f"No coordinates for {icao}. Add to AIRPORT_COORDS."}
 
     lat, lon = coords
     radius = args.radius
@@ -599,8 +592,7 @@ def cmd_lightning(args):
         out["farthest_strike_nm"] = round(max(s["distance_nm"] for s in strikes), 1)
     out["strikes"] = strikes[:50]  # cap output size
 
-    json.dump(out, sys.stdout, indent=2)
-    print()
+    return out
 
 
 # =========================================================================
@@ -779,8 +771,7 @@ def cmd_rvr(args):
     result["risk_emoji"] = emoji
     result["note"] = note
 
-    json.dump(result, sys.stdout, indent=2)
-    print()
+    return result
 
 
 # =========================================================================
@@ -917,9 +908,7 @@ def _infer_atfm(flt):
 def cmd_atfm_infer(args):
     api_key = os.environ.get("AEROAPI_KEY")
     if not api_key:
-        json.dump({"error": "AEROAPI_KEY not set",
-                    "source": "ATFM Inference"}, sys.stdout, indent=2)
-        print(); return
+        return {"error": "AEROAPI_KEY not set", "source": "ATFM Inference"}
 
     flight = _to_icao_carrier(args.flight.upper())
     qs = ""
@@ -933,15 +922,13 @@ def cmd_atfm_infer(args):
         )
         data = json.loads(raw)
     except Exception as e:
-        json.dump({"error": f"AeroAPI: {e}", "source": "ATFM Inference",
-                    "flight": flight}, sys.stdout, indent=2)
-        print(); return
+        return {"error": f"AeroAPI: {e}", "source": "ATFM Inference",
+                "flight": flight}
 
     flights = data.get("flights", [])
     if not flights:
-        json.dump({"error": f"No flights for {flight}",
-                    "source": "ATFM Inference"}, sys.stdout, indent=2)
-        print(); return
+        return {"error": f"No flights for {flight}",
+                "source": "ATFM Inference"}
 
     flt = flights[0]
     atfm = _infer_atfm(flt)
@@ -959,15 +946,14 @@ def cmd_atfm_infer(args):
     }
     out.update(atfm)
 
-    json.dump(out, sys.stdout, indent=2)
-    print()
+    return out
 
 
 # =========================================================================
 #  CLI
 # =========================================================================
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(
         description="Enhanced airport operations data for Pro Flight Tracker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1025,16 +1011,33 @@ Subcommands:
     at.add_argument("--flight", required=True, help="Flight (e.g. DL182)")
     at.add_argument("--date", help="YYYY-MM-DD")
 
+    return ap
+
+
+def dispatch(args) -> dict:
+    """Run a parsed command in-process and return its payload.
+
+    The cmd_* functions used to print JSON themselves; they now return
+    dicts so app.py can import this script as a module instead of
+    spawning it. main() still prints for the CLI.
+    """
+    return {"gairmet": cmd_gairmet,
+            "tcf": cmd_tcf,
+            "lightning": cmd_lightning,
+            "rvr": cmd_rvr,
+            "atfm-infer": cmd_atfm_infer}[args.cmd](args)
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
     if not args.cmd:
         ap.print_help()
         sys.exit(1)
 
-    {"gairmet": cmd_gairmet,
-     "tcf": cmd_tcf,
-     "lightning": cmd_lightning,
-     "rvr": cmd_rvr,
-     "atfm-infer": cmd_atfm_infer}[args.cmd](args)
+    result = dispatch(args)
+    json.dump(result, sys.stdout, indent=2)
+    print()
 
 
 if __name__ == "__main__":
