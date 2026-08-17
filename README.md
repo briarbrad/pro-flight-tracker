@@ -1,6 +1,6 @@
 # ✈️ Pro Flight Tracker API
 
-A flight delay risk data engine that pulls from 15+ real-time aviation sources,
+A flight delay risk data engine that pulls from 17+ real-time aviation sources,
 including direct FAA SWIM feeds — the same data pipeline airlines and air
 traffic control run on.
 
@@ -26,10 +26,10 @@ weather, and FAA operational data and serves it as JSON.
          ▼
    ┌─────────────────────────────────────────────┐
    │ flight_data.py      AeroAPI, ADS-B, OpenSky │
-   │ aviation_weather.py METAR/TAF/SIGMET/PIREP  │
-   │                     /FAA NAS status         │
-   │ airport_ops.py      G-AIRMET, lightning,    │
-   │                     RVR, ATFM inference     │
+   │ aviation_weather.py METAR/TAF/SIGMET/       │
+   │                     ISIGMET/PIREP/FAA NAS   │
+   │ airport_ops.py      G-AIRMET, TCF,          │
+   │                     lightning, RVR, ATFM    │
    │ swim_consumer.py    8 FAA SWIM feeds        │
    │                     └→ Java JMS client      │
    └─────────────────────────────────────────────┘
@@ -56,8 +56,8 @@ Full reference with response shapes lives in [RORK_BRIEF.md](RORK_BRIEF.md).
 |---|---|---|---|
 | Health | `/health` | free | instant |
 | Flight | `/api/flight/status`, `/chain`, `/track` | **AeroAPI** | 1–5s |
-| Weather | `/api/weather/metar`, `/taf`, `/sigmet`, `/pirep`, `/faa-status`, `/brief` | free | 1–3s |
-| Airport ops | `/api/ops/gairmet`, `/lightning`, `/rvr`, `/atfm` | free | 1–20s |
+| Weather | `/api/weather/metar`, `/taf`, `/sigmet`, `/isigmet`, `/pirep`, `/faa-status`, `/brief` | free | 1–3s |
+| Airport ops | `/api/ops/gairmet`, `/tcf`, `/lightning`, `/rvr`, `/atfm` | free | 1–20s |
 | FAA SWIM | `/api/swim/{tbfm,sfdps,itws,notams,stdds,tfms-flight,tfms-flow,tfdm}` | free | duration + ~4s |
 | Aggregate | `/api/check` | **AeroAPI** | 30–60s |
 | Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with horizon |
@@ -76,9 +76,11 @@ eight SWIM feeds are free to call as often as useful.
 | ADS-B Exchange | API key | flight_data.py | Real-time aircraft position |
 | OpenSky Network | optional | flight_data.py | Fallback position |
 | METAR / TAF | none | aviation_weather.py | Observations, terminal forecasts |
-| SIGMET / PIREP | none | aviation_weather.py | Severe weather, pilot reports |
+| SIGMET / PIREP | none | aviation_weather.py | Severe weather (CONUS), pilot reports |
+| ISIGMET | none | aviation_weather.py | Severe weather outside CONUS (AK/HI/Pacific + international FIRs) |
 | FAA NAS Status | none | aviation_weather.py | GDPs, ground stops, delay programs |
 | G-AIRMET | none | airport_ops.py | Turbulence/icing forecast polygons |
+| TCF | none | airport_ops.py | TFM Convective Forecast — thunderstorm coverage driving FAA ground stops/reroutes |
 | Blitzortung | none | airport_ops.py | Live lightning (ramp closure risk) |
 | FAA RVR | none | airport_ops.py | Per-runway visual range |
 | SWIM TBFM | SWIM password | swim_consumer.py | ATC arrival metering |

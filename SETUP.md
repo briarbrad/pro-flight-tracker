@@ -84,7 +84,7 @@ Expected response:
 {
   "status": "ok",
   "service": "pro-flight-tracker",
-  "version": "1.3",
+  "version": "1.4",
   "timestamp": "2026-08-16T15:30:00Z"
 }
 ```

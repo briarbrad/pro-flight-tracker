@@ -2,8 +2,10 @@
 """
 airport_ops.py — Enhanced airport operations data for Pro Flight Tracker.
 
-Four orthogonal data sources that fill gaps in the base flight/weather scripts:
+Five orthogonal data sources that fill gaps in the base flight/weather scripts:
   - G-AIRMET:    Gridded turbulence & wind shear forecasts (NWS/AWC)
+  - TCF:         TFM Convective Forecast — the product FAA traffic management
+                 actually uses to call ground stops/reroutes for thunderstorms
   - Lightning:   Real-time lightning strikes near airports (Blitzortung)
   - RVR:         Runway Visual Range per-runway from FAA sensors
   - ATFM Infer:  Eurocontrol ATFM regulation inference from delay patterns
@@ -13,6 +15,7 @@ and flight_data.py (argparse CLI, env-var secrets, structured JSON output).
 
 Usage:
     python3 airport_ops.py gairmet [--hazard turb-hi turb-lo llws] [--route KJFK LIRF]
+    python3 airport_ops.py tcf [--route KJFK KATL]
     python3 airport_ops.py lightning --icao KJFK [--radius 20] [--duration 30]
     python3 airport_ops.py rvr --airport JFK [--raw-metar "KJFK ... R04L/2000V4000FT ..."]
     python3 airport_ops.py atfm-infer --flight DL182 [--date 2026-08-15]
@@ -362,7 +365,142 @@ def cmd_gairmet(args):
 
 
 # =========================================================================
-#  2.  Lightning  (Blitzortung real-time network)
+#  2.  TCF  (TFM Convective Forecast — the product FAA traffic management
+#      uses to decide ground stops/reroutes for thunderstorms, 2-6h out)
+# =========================================================================
+
+def _fetch_tcf():
+    """Pull the TCF convective-coverage polygons as a GeoJSON FeatureCollection."""
+    try:
+        raw = _http_get(f"{AWC_BASE}/tcf?format=geojson")
+        return json.loads(raw)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _polygon_from_geojson(coordinates):
+    """Flatten a GeoJSON Polygon's outer ring — [[lon,lat], ...] — into
+    (lat, lon) tuples so it can reuse the same haversine/segment helpers as
+    G-AIRMET."""
+    if not coordinates:
+        return []
+    ring = coordinates[0] if coordinates and isinstance(coordinates[0], list) \
+        and coordinates[0] and isinstance(coordinates[0][0], (list, tuple)) \
+        else coordinates
+    pts = []
+    for pair in ring:
+        try:
+            lon, lat = pair[0], pair[1]
+            pts.append((float(lat), float(lon)))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return pts
+
+
+def _tcf_relevant(feature, origin, dest):
+    """Determine if a single TCF polygon is relevant to the route."""
+    geom = feature.get("geometry") or {}
+    if geom.get("type") != "Polygon":
+        return None
+    polygon = _polygon_from_geojson(geom.get("coordinates"))
+    if not polygon:
+        return None
+
+    o = AIRPORT_COORDS.get(origin)
+    d = AIRPORT_COORDS.get(dest)
+    near_origin = near_dest = along_route = False
+
+    if o:
+        for plat, plon in polygon:
+            if haversine_nm(o[0], o[1], plat, plon) < 100:
+                near_origin = True
+                break
+    if d:
+        for plat, plon in polygon:
+            if haversine_nm(d[0], d[1], plat, plon) < 100:
+                near_dest = True
+                break
+    if o and d and not (near_origin or near_dest):
+        for plat, plon in polygon:
+            if _point_near_segment(plat, plon, o[0], o[1], d[0], d[1]):
+                along_route = True
+                break
+
+    if not (near_origin or near_dest or along_route):
+        return None
+
+    props = feature.get("properties") or {}
+    return {
+        "valid_time": props.get("validTime"),
+        "issue_time": props.get("issueTime"),
+        "coverage": props.get("coverage"),
+        "confidence": props.get("confidence"),
+        "tops_hundreds_ft": props.get("tops"),
+        "near_origin": near_origin,
+        "near_dest": near_dest,
+        "along_route": along_route,
+    }
+
+
+def cmd_tcf(args):
+    fc = _fetch_tcf()
+
+    result = {
+        "source": "AWC TFM Convective Forecast (TCF)",
+        "timestamp": now_utc(),
+    }
+
+    if isinstance(fc, dict) and fc.get("error"):
+        result["error"] = fc["error"]
+        json.dump(result, sys.stdout, indent=2)
+        print()
+        return
+
+    features = fc.get("features", []) if isinstance(fc, dict) else []
+    result["issue_time"] = fc.get("issueTime") if isinstance(fc, dict) else None
+
+    if args.route and len(args.route) == 2:
+        origin, dest = [x.upper() for x in args.route]
+        relevant = []
+        for feat in features:
+            hit = _tcf_relevant(feat, origin, dest)
+            if hit:
+                relevant.append(hit)
+
+        result["route"] = f"{origin}-{dest}"
+        result["relevant_count"] = len(relevant)
+        result["relevant"] = relevant
+
+        coverages = [r["coverage"] for r in relevant]
+        if "medium" in coverages:
+            result["risk_level"] = "MODERATE"
+            result["risk_emoji"] = "🟡"
+        elif relevant:
+            result["risk_level"] = "LOW"
+            result["risk_emoji"] = "🟢"
+        else:
+            result["risk_level"] = "NONE"
+            result["risk_emoji"] = "🟢"
+            result["summary"] = "No convective forecast areas along route"
+    else:
+        # Dump all active TCF polygons nationwide
+        result["total_active"] = len(features)
+        result["items"] = [
+            {
+                "coverage": (f.get("properties") or {}).get("coverage"),
+                "confidence": (f.get("properties") or {}).get("confidence"),
+                "tops_hundreds_ft": (f.get("properties") or {}).get("tops"),
+                "valid_time": (f.get("properties") or {}).get("validTime"),
+            }
+            for f in features
+        ]
+
+    json.dump(result, sys.stdout, indent=2)
+    print()
+
+
+# =========================================================================
+#  3.  Lightning  (Blitzortung real-time network)
 # =========================================================================
 
 async def _collect_strikes(lat, lon, radius_nm, duration_sec):
@@ -466,7 +604,7 @@ def cmd_lightning(args):
 
 
 # =========================================================================
-#  3.  RVR  (FAA Runway Visual Range)
+#  4.  RVR  (FAA Runway Visual Range)
 # =========================================================================
 
 def _parse_rvr_html(html):
@@ -646,7 +784,7 @@ def cmd_rvr(args):
 
 
 # =========================================================================
-#  4.  ATFM Inference  (Eurocontrol heuristic from AeroAPI data)
+#  5.  ATFM Inference  (Eurocontrol heuristic from AeroAPI data)
 # =========================================================================
 
 def _is_eurocontrol(icao):
@@ -836,6 +974,8 @@ def main():
         epilog="""
 Subcommands:
   gairmet      G-AIRMET turbulence / wind-shear forecasts (NWS/AWC)
+  tcf          TFM Convective Forecast — thunderstorm coverage driving
+               FAA ground stops/reroutes (NWS/AWC)
   lightning    Real-time lightning near an airport (Blitzortung)
   rvr          Runway Visual Range per-runway (FAA)
   atfm-infer   Eurocontrol ATFM regulation inference from delay patterns
@@ -852,6 +992,14 @@ Subcommands:
         help="Hazard types (default: turb-hi turb-lo llws)",
     )
     ga.add_argument(
+        "--route", nargs=2, metavar=("ORIGIN", "DEST"),
+        help="Filter to route between two ICAO airports",
+    )
+
+    # -- tcf --
+    tc = sub.add_parser("tcf", help="TFM Convective Forecast (2-6h "
+                                    "thunderstorm coverage/confidence)")
+    tc.add_argument(
         "--route", nargs=2, metavar=("ORIGIN", "DEST"),
         help="Filter to route between two ICAO airports",
     )
@@ -883,6 +1031,7 @@ Subcommands:
         sys.exit(1)
 
     {"gairmet": cmd_gairmet,
+     "tcf": cmd_tcf,
      "lightning": cmd_lightning,
      "rvr": cmd_rvr,
      "atfm-infer": cmd_atfm_infer}[args.cmd](args)

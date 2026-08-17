@@ -172,6 +172,14 @@ _FAA_TO_ICAO = {
 _ICAO_TO_FAA = {v: k for k, v in _FAA_TO_ICAO.items()}
 
 
+def _is_conus(icao: str) -> bool:
+    """True for contiguous-US ICAO codes (the domestic /airsigmet coverage
+    area). Alaska/Hawaii/territories are 'P'/'T'/'N'-prefixed, same as every
+    non-US airport — all of them are blind spots for the domestic SIGMET feed
+    and need the international one instead."""
+    return bool(icao) and icao.startswith("K")
+
+
 def to_icao(code: str) -> str:
     """Best-effort 4-letter ICAO. Passes through anything already 4 chars."""
     c = clean_ident(code)
@@ -278,7 +286,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "pro-flight-tracker",
-"version": "1.3",
+"version": "1.4",
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
@@ -378,6 +386,19 @@ def weather_sigmet():
     return jsonify(data), status
 
 
+@app.route("/api/weather/isigmet")
+def weather_isigmet():
+    """Get international SIGMETs — Alaska, Hawaii/Pacific, and non-US FIRs,
+    which the domestic /api/weather/sigmet endpoint doesn't cover."""
+    hazard = request.args.get("hazard", "")
+    args = ["isigmet"]
+    if hazard:
+        args += ["--hazard", hazard]
+
+    data, status = run_script("aviation_weather.py", args)
+    return jsonify(data), status
+
+
 @app.route("/api/weather/pirep")
 def weather_pirep():
     """Get PIREPs near an airport."""
@@ -442,6 +463,22 @@ def ops_gairmet():
     if hazard:
         hazards = [s.strip() for s in hazard.split(",")]
         args += ["--hazard"] + hazards
+
+    data, status = run_script("airport_ops.py", args)
+    return jsonify(data), status
+
+
+@app.route("/api/ops/tcf")
+def ops_tcf():
+    """Get the TFM Convective Forecast — thunderstorm coverage/confidence
+    driving FAA ground stops and reroutes, 2-6h out."""
+    route = request.args.get("route", "")
+
+    args = ["tcf"]
+    if route:
+        airports, _ = airport_list(route)
+        if airports and len(airports) == 2:
+            args += ["--route"] + airports
 
     data, status = run_script("airport_ops.py", args)
     return jsonify(data), status
@@ -697,6 +734,12 @@ def check_flight():
                 "timeout": 20
             },
             {
+                "key": "tcf",
+                "script": "airport_ops.py",
+                "args": ["tcf", "--route", origin_icao, dest_icao],
+                "timeout": 20
+            },
+            {
                 "key": "rvr_origin",
                 "script": "airport_ops.py",
                 "args": ["rvr", "--airport", _icao_to_faa(origin_icao)],
@@ -709,6 +752,17 @@ def check_flight():
                 "timeout": 20
             },
         ])
+
+        # Domestic /airsigmet (already in the phase-1 "sigmet" task) doesn't
+        # cover Alaska, Hawaii, or anywhere outside the contiguous US — only
+        # pull the international feed when the route actually leaves it.
+        if not _is_conus(origin_icao) or not _is_conus(dest_icao):
+            phase2_tasks.append({
+                "key": "isigmet",
+                "script": "aviation_weather.py",
+                "args": ["isigmet"],
+                "timeout": 15,
+            })
 
         # SWIM feeds for origin airport
         phase2_tasks.extend([
@@ -947,9 +1001,18 @@ def flight_brief():
     if plan["sigmet"]["relevant"]:
         tasks.append({"key": "sigmet", "script": "aviation_weather.py",
                       "args": ["sigmet"], "timeout": 15})
+    if plan["isigmet"]["relevant"] and airports and (not _is_conus(origin) or not _is_conus(dest)):
+        # Domestic /airsigmet doesn't cover Alaska, Hawaii, or anywhere
+        # outside the contiguous US — only fetch this extra call when the
+        # route actually leaves that coverage area.
+        tasks.append({"key": "isigmet", "script": "aviation_weather.py",
+                      "args": ["isigmet"], "timeout": 15})
     if plan["gairmet"]["relevant"] and origin and dest:
         tasks.append({"key": "gairmet", "script": "airport_ops.py",
                       "args": ["gairmet", "--route", origin, dest], "timeout": 20})
+    if plan["tcf"]["relevant"] and origin and dest:
+        tasks.append({"key": "tcf", "script": "airport_ops.py",
+                      "args": ["tcf", "--route", origin, dest], "timeout": 20})
     if plan["tfms_flow"]["relevant"]:
         tasks.append({"key": "tfms_flow", "script": "swim_consumer.py",
                       "args": ["tfms-flow", "--keyword", "GDP", "--duration", "10"],
@@ -1019,13 +1082,48 @@ def flight_brief():
             }
 
     # --- Step 5: deterministic analysis.
+    origin_tz = analysis.resolve_timezone(origin, primary.get("origin_timezone"))
+    dest_tz = analysis.resolve_timezone(dest, primary.get("dest_timezone"))
+
     programs = analysis._programs_from_faa(
         (sources.get("faa_status") or {}).get("data"))
-    branch = analysis.classify_branch(horizon, programs, turn_analysis, plan)
-    verdict = analysis.assess(horizon, branch, turn_analysis, primary)
+
+    # Terminal forecast across the actual departure and arrival windows.
+    # Beyond ~6h out this is the only source still carrying signal, so it has
+    # to reach the verdict — not just the narrative.
+    taf_payload = (sources.get("taf") or {}).get("data")
+    dep_ref = (analysis.parse_iso(primary.get("estimated_out"))
+               or analysis.parse_iso(primary.get("scheduled_out")))
+    arr_ref = (analysis.parse_iso(primary.get("estimated_in"))
+               or analysis.parse_iso(primary.get("scheduled_in")))
+    taf_windows = {}
+    weather_effects = []
+    if taf_payload and dep_ref:
+        dep_taf = analysis.analyze_taf(
+            taf_payload, origin,
+            dep_ref - timedelta(minutes=60), dep_ref + timedelta(minutes=60),
+            origin_tz)
+        taf_windows["departure"] = dep_taf
+        weather_effects += analysis.taf_effects(dep_taf, "departure")
+    if taf_payload and arr_ref:
+        arr_taf = analysis.analyze_taf(
+            taf_payload, dest,
+            arr_ref - timedelta(minutes=60), arr_ref + timedelta(minutes=60),
+            dest_tz)
+        taf_windows["arrival"] = arr_taf
+        weather_effects += analysis.taf_effects(arr_taf, "arrival")
+
+    branch = analysis.classify_branch(horizon, programs, turn_analysis, plan,
+                                      weather_effects)
     effects = analysis.build_effects(primary, programs, turn_analysis,
-                                     edct, horizon)
-    predictions = analysis.predict_times(primary, edct, horizon)
+                                     edct, horizon) + weather_effects
+    verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects)
+    predictions = analysis.predict_times(primary, edct, horizon,
+                                         origin_tz=origin_tz, dest_tz=dest_tz)
+
+    # Severity order so the client can render top-down without re-sorting.
+    _sev = {"ACTION": 0, "WATCH": 1, "INFO": 2}
+    effects.sort(key=lambda e: _sev.get(e.get("severity"), 3))
 
     excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
 
@@ -1035,6 +1133,7 @@ def flight_brief():
     # rule to report rather than re-derive them.
     payload["facts"]["effects"] = effects
     payload["facts"]["predicted_times"] = predictions
+    payload["facts"]["taf_windows"] = taf_windows
     payload["guardrails"].append(
         "Predicted gate/takeoff/arrival times and any EDCT are already "
         "computed and included in the facts. Report them with their stated "
@@ -1052,6 +1151,8 @@ def flight_brief():
         "verdict": verdict,
         "effects": effects,
         "predicted_times": predictions,
+        "taf_windows": taf_windows,
+        "timezones": {"origin": origin_tz, "destination": dest_tz},
         "branch_classification": branch,
         "sources_consulted": sorted(k for k, v in sources.items()
                                     if v.get("status") == "ok"),

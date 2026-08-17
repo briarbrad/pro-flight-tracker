@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.3","timestamp":"..."}
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.4","timestamp":"..."}
 ```
 
 `/health` does **not** touch the database or any upstream API, so a 200 here
@@ -55,7 +55,7 @@ common source of parsing bugs. Do not assume a uniform `{data: ...}` wrapper.
 ```
 
 `data` is **keyed by ICAO code** for `metar`, `taf`, and `faa-status`. It is an
-**array** for `sigmet` and `pirep` (those also add a top-level `count`).
+**array** for `sigmet`, `isigmet`, and `pirep` (those also add a top-level `count`).
 
 ### Envelope B — flight data endpoints (`/api/flight/*`)
 
@@ -136,7 +136,8 @@ empirically before relying on it.
 |---|---|---|
 | `GET /api/weather/metar` | `icao` (comma-separated) | Current observations, keyed by airport |
 | `GET /api/weather/taf` | `icao` (comma-separated) | Terminal forecasts, keyed by airport |
-| `GET /api/weather/sigmet` | `type` | Array + `count`. Severe weather areas with polygons |
+| `GET /api/weather/sigmet` | `type` | Array + `count`. Severe weather areas with polygons — **CONUS only** |
+| `GET /api/weather/isigmet` | `hazard` (`turb`\|`ice`) | Array + `count`. Same as `sigmet` but for everywhere `sigmet` doesn't cover: Alaska, Hawaii/Pacific, and every non-US FIR |
 | `GET /api/weather/pirep` | `icao` (req), `distance` (default `200`, clamped 1–500) | Array + `count` |
 | `GET /api/weather/faa-status` | `icao` (comma-separated) | GDPs / ground stops, keyed by airport |
 | `GET /api/weather/brief` | `origin`, `dest` | Combined route briefing |
@@ -156,6 +157,7 @@ conversion happened, a top-level `resolved` map shows it
 | Endpoint | Query params | Notes |
 |---|---|---|
 | `GET /api/ops/gairmet` | `route` (comma-separated), `hazard` | Turbulence/icing forecast polygons |
+| `GET /api/ops/tcf` | `route` (comma-separated) | TFM Convective Forecast — thunderstorm coverage/confidence 2-6h out, the product FAA traffic management actually uses to call ground stops/reroutes. Without `route`, dumps every active polygon nationwide |
 | `GET /api/ops/lightning` | `icao` (req), `radius` (default `20`), `duration` (default `10`) | **Blocks for `duration` seconds** — it's a live WebSocket capture |
 | `GET /api/ops/rvr` | `airport` (req; `icao` also accepted) | Either code form works |
 | `GET /api/ops/atfm` | `flight` (req), `date` | Eurocontrol regulation inference |
@@ -211,7 +213,7 @@ POST /api/check   body: {"flight":"DL244","date":"2026-08-16"}
 ```
 
 This is the expensive, comprehensive one. It runs in two phases: it fetches
-flight status first (to learn origin/destination), then fans out ~12 more
+flight status first (to learn origin/destination), then fans out ~13-14 more
 sources in parallel using those airports.
 
 **Response shape:**
@@ -231,7 +233,9 @@ sources in parallel using those airports.
     "faa_status":       { ...Envelope A... },
     "pirep_origin":     { ...Envelope A... },
     "sigmet":           { ...Envelope A... },
+    "isigmet":          { ...Envelope A... },
     "gairmet":          { ...Envelope D... },
+    "tcf":              { ...Envelope D... },
     "rvr_origin":       { ...Envelope D... },
     "lightning_origin": { ...Envelope D... },
     "tbfm":             { ...Envelope C... },
@@ -250,8 +254,14 @@ Envelope C, `data.lightning_origin` is Envelope D. Parse each accordingly.
 **Keys are not guaranteed present.** If phase 1 can't determine origin and
 destination — bad flight number, AeroAPI failure, a flight not in the system —
 the entire phase-2 airport-dependent block is skipped, and `metar`, `taf`,
-`faa_status`, `tbfm`, `itws_origin`, `rvr_origin`, `lightning_origin`, and
-`gairmet` simply won't exist in the response. Always check for presence.
+`faa_status`, `tbfm`, `itws_origin`, `rvr_origin`, `lightning_origin`, `gairmet`,
+and `tcf` simply won't exist in the response. Always check for presence.
+
+**`isigmet` is conditional even when phase 2 runs.** It only appears when
+either airport is outside the contiguous US — `sigmet` already covers CONUS,
+so `isigmet` is skipped as redundant on an all-CONUS route (e.g. JFK–LAX).
+It shows up on anything touching Alaska, Hawaii, or an international airport
+(e.g. JFK–FCO).
 
 **Per-source failures are inlined, not fatal.** If one source fails, its key
 holds `{"error": ...}` while everything else succeeds. The HTTP status is still
@@ -368,6 +378,31 @@ case; only flights captured by a traffic management program get one).
 `CONTROLLED` means an FAA-assigned time — treat it as authoritative over any
 airline estimate. EDCTs are fetched via SWIM only within ~6h of departure.
 
+
+**Local times.** Each prediction also carries `local_display` ("10:02 AM EDT"),
+`time_local`, `utc_display`, and `timezone`. Gate and takeoff use the origin's
+zone; arrival uses the destination's. `timezone: ""` means unresolved — the
+display falls back to Zulu rather than guessing an offset. A top-level
+`timezones: {origin, destination}` is included too.
+
+**`taf_windows`** assesses the terminal forecast across the ±60 min around the
+predicted departure and arrival, with `prevailing_category` (VFR/MVFR/IFR/LIFR
+from FM groups) separated from `worst_conditional_category` (TEMPO/PROB). Only
+prevailing IFR/LIFR, thunderstorms, or freezing precipitation escalate the
+verdict; MVFR, gusts, shear and TEMPO groups surface as WATCH/INFO without
+moving it. This is what makes a 12h+ flight assessable at all — beyond ~6h the
+TAF is the only source still in play.
+
+**`isigmet` and `tcf` (added)** — both consulted within a 6h horizon and
+included in `sources` / `llm_payload.facts`, same treatment as `sigmet` and
+`gairmet` already got: raw findings for the model to reason about, not
+deterministic verdict inputs. Only `taf_windows` escalates the verdict itself;
+these two widen situational awareness without another escalation path to keep
+calibrated. `isigmet` is gated the same way as in `/api/check` — only fetched
+when the route leaves CONUS. `tcf` is always fetched once origin/dest are
+known and within horizon; its `relevant[]` array is empty (not absent) when no
+convective forecast area intersects the route.
+
 ### Reading the verdict
 
 **`confidence` matters as much as `departure_risk`.** At `NEXT_DAY` or
@@ -390,7 +425,8 @@ Cheaper than `/api/check`, and it scales down with distance:
 
 | Horizon | AeroAPI queries | Sources consulted |
 |---|---|---|
-| 0–12h | 4 | 7–10 |
+| 0–6h | 4 | 8–12 (adds `isigmet` on non-CONUS routes, `tcf` always) |
+| 6–12h | 4 | 7–10 |
 | 12h+ | **2** | 2 |
 
 The equipment chain is skipped past 12h because the inbound aircraft isn't
@@ -572,7 +608,7 @@ long stretches. Only treat a response as failed if it actually carries `error`.
 
 Be aware of these before deciding what the client is responsible for.
 
-**`/api/check` returns no interpretation.** It hands back raw data from ~15
+**`/api/check` returns no interpretation.** It hands back raw data from ~17
 sources — no score, no verdict, no summary. If you want a judgement, use
 `/api/brief` (§4b), which does the analysis deterministically and returns a
 verdict, a delay-mechanism classification, and an LLM prompt payload. There is a `risk_emoji` and
@@ -651,13 +687,35 @@ data.KJFK.ground_delay_programs[]
 data.KJFK.arrival_departure_delays[]
 data.KJFK.closures[]
 
-# SIGMET (Envelope A, array + count)
+# SIGMET (Envelope A, array + count) — CONUS only
 data[].hazard                          "CONVECTIVE" / "TURB" / "ICE"
 data[].severity                        numeric
 data[].area_coords[]                   {lat, lon} polygon
 data[].valid_from / .valid_to
 data[].altitude_low_ft / .altitude_hi_ft
 data[].movement.direction_deg / .speed_kts
+
+# ISIGMET (Envelope A, array + count) — Alaska/Hawaii/Pacific + non-US FIRs
+data[].hazard                          "TURB" / "ICE"
+data[].fir_id / .fir_name              e.g. "PAZA" / "ANCHORAGE"
+data[].base_ft / .top_ft
+data[].area_coords[]                   {lat, lon} polygon
+data[].valid_from / .valid_to
+data[].movement.direction / .speed_kts
+
+# G-AIRMET (Envelope D, only when queried with ?route=)
+relevant[].hazard / .severity          "TURB-HI" etc / "MOD" | "SEV" | "EXTM"
+relevant[].base_ft / .top_ft
+relevant[].near_origin / .near_dest / .along_route   bool
+risk_level                             "NONE" | "LOW" | "MODERATE" | "HIGH"
+
+# TCF (Envelope D, only when queried with ?route=)
+relevant[].coverage                    "sparse" | "medium"
+relevant[].confidence                  forecaster confidence in the coverage call
+relevant[].tops_hundreds_ft            echo top category
+relevant[].valid_time / .issue_time
+relevant[].near_origin / .near_dest / .along_route   bool
+risk_level                             "NONE" | "LOW" | "MODERATE"
 
 # TFMS flight (Envelope C)
 results[].flight_id                    "AAL1724"
@@ -702,3 +760,9 @@ results[].effective_start / .effective_end
 8. **Empty SWIM results are normal**, not failures.
 9. **AeroAPI credit is small and non-rolling** — every design decision that
    touches `/api/flight/*` or `/api/check` should account for it.
+10. **`isigmet` only appears on routes leaving CONUS.** Don't treat its
+    absence as an error — on a JFK–LAX check it's correctly never fetched
+    because `sigmet` already has that airspace covered.
+11. **`tcf`/`gairmet`'s `relevant[]` can be legitimately empty.** No
+    convective/turbulence polygons intersecting the route is the common case,
+    not a fetch failure — check `risk_level`/`error`, not just array length.

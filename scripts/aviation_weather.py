@@ -5,7 +5,8 @@ aviation_weather.py — Aviation weather data tool for Pro Flight Tracker.
 Pulls aviation-specific weather from free government APIs:
   - METAR (current observations)        aviationweather.gov
   - TAF   (terminal area forecasts)     aviationweather.gov
-  - SIGMET / Convective SIGMET          aviationweather.gov
+  - SIGMET / Convective SIGMET          aviationweather.gov  (domestic, CONUS)
+  - ISIGMET (international SIGMET)      aviationweather.gov  (AK/HI/Pacific + non-US FIRs)
   - PIREP (pilot reports)               aviationweather.gov
   - FAA airport delay status            nasstatus.faa.gov
 
@@ -15,6 +16,7 @@ Usage:
     python3 aviation_weather.py metar   --icao KJFK KLGA
     python3 aviation_weather.py taf     --icao KJFK
     python3 aviation_weather.py sigmet  [--type convective]
+    python3 aviation_weather.py isigmet [--hazard turb|ice]
     python3 aviation_weather.py pirep   --icao KJFK [--distance 200]
     python3 aviation_weather.py faa-status --icao KJFK KLGA
     python3 aviation_weather.py brief   --origin KJFK --dest KLAX
@@ -387,6 +389,74 @@ def _expiry_minutes(valid_to_ts) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# International SIGMET
+# ---------------------------------------------------------------------------
+#
+# /airsigmet only covers the contiguous US. Alaska, Hawaii/Pacific, and every
+# non-US FIR are blind spots for that endpoint — this fills them from
+# /isigmet, which has no domestic/international split of its own and simply
+# returns whatever is globally active.
+
+def fetch_isigmet(hazard: str = None) -> dict:
+    """Fetch active international SIGMETs (ISIGMETs).
+
+    hazard: optional filter, 'turb' or 'ice'. None fetches all hazards.
+    """
+    url = f"{AWX_BASE}/isigmet?format=json"
+    if hazard:
+        url += f"&hazard={hazard}"
+
+    errors = []
+    all_isigmets = []
+
+    try:
+        data = _fetch_json(url)
+    except Exception as exc:
+        return {"data": [], "count": 0,
+                "errors": [f"ISIGMET fetch failed: {exc}"]}
+
+    if not isinstance(data, list):
+        return {"data": [], "count": 0,
+                "errors": ["ISIGMET: unexpected response format"]}
+
+    for sig in data:
+        coords = []
+        for c in sig.get("coords", []) or []:
+            coords.append({
+                "lat": c.get("lat"),
+                "lon": c.get("lon"),
+            })
+
+        all_isigmets.append({
+            "id": _safe(sig.get("seriesId")),
+            "issuing_office": _safe(sig.get("icaoId")),
+            "fir_id": _safe(sig.get("firId")),
+            "fir_name": _safe(sig.get("firName")),
+            "hazard": _safe(sig.get("hazard")),
+            "qualifier": _safe(sig.get("qualifier")),
+            "valid_from": _ts_to_iso(sig.get("validTimeFrom")),
+            "valid_to": _ts_to_iso(sig.get("validTimeTo")),
+            "expires_in_minutes": _expiry_minutes(sig.get("validTimeTo")),
+            "base_ft": _safe(sig.get("base")),
+            "top_ft": _safe(sig.get("top")),
+            "geometry_type": _safe(sig.get("geom")),
+            "movement": {
+                "direction": _safe(sig.get("dir")),
+                "speed_kts": _safe(sig.get("spd")),
+            } if sig.get("dir") is not None or sig.get("spd") is not None else None,
+            "change": _safe(sig.get("chng")),
+            "area_coords": coords if coords else None,
+            "raw": _safe(sig.get("rawSigmet")),
+        })
+
+    return {
+        "data": all_isigmets,
+        "count": len(all_isigmets),
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # PIREPs
 # ---------------------------------------------------------------------------
 
@@ -739,11 +809,12 @@ def fetch_brief(origin: str, dest: str) -> dict:
 
     stations = [origin, dest]
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=7) as pool:
         futures = {
             pool.submit(fetch_metar, stations): "metar",
             pool.submit(fetch_taf, stations): "taf",
             pool.submit(fetch_sigmet, "all"): "sigmet",
+            pool.submit(fetch_isigmet): "isigmet",
             pool.submit(fetch_pirep, stations, 200): "pirep",
             pool.submit(fetch_faa_status, stations): "faa_status",
         }
@@ -795,6 +866,12 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["sigmet", "convective", "conv", "all"],
                        help="SIGMET type (default: all)")
 
+    # isigmet
+    p_isig = sub.add_parser("isigmet", help="Fetch international SIGMETs "
+                                             "(AK/HI/Pacific + non-US FIRs)")
+    p_isig.add_argument("--hazard", default=None, choices=["turb", "ice"],
+                        help="Filter by hazard (default: all)")
+
     # pirep
     p_pirep = sub.add_parser("pirep", help="Fetch PIREPs")
     p_pirep.add_argument("--icao", nargs="+", required=True,
@@ -830,6 +907,8 @@ def main() -> None:
         result = fetch_taf(args.icao)
     elif args.command == "sigmet":
         result = fetch_sigmet(args.type)
+    elif args.command == "isigmet":
+        result = fetch_isigmet(args.hazard)
     elif args.command == "pirep":
         result = fetch_pirep(args.icao, args.distance)
     elif args.command == "faa-status":

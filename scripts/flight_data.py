@@ -211,8 +211,13 @@ def _parse_aeroapi_flight(f):
         "status": f.get("status"),
         "origin_icao": origin.get("code"), "origin_iata": origin.get("code_iata"),
         "origin_name": origin.get("name"), "origin_city": origin.get("city"),
+        # IANA zone (e.g. "America/New_York") — AeroAPI supplies this on the
+        # airport object. Used to render times in airport-local time instead
+        # of Zulu. May be absent; callers fall back to a lookup table.
+        "origin_timezone": origin.get("timezone"),
         "dest_icao": dest.get("code"), "dest_iata": dest.get("code_iata"),
         "dest_name": dest.get("name"), "dest_city": dest.get("city"),
+        "dest_timezone": dest.get("timezone"),
         "scheduled_out": f.get("scheduled_out"), "estimated_out": f.get("estimated_out"),
         "actual_out": f.get("actual_out"),
         "scheduled_off": f.get("scheduled_off"), "estimated_off": f.get("estimated_off"),
