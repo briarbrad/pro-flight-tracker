@@ -29,11 +29,18 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.5","timestamp":"..."}
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.8","timestamp":"...",
+   "store":{...},"tracker_leader":true,"cache_entries":N,"breakers":{...},"swim_daemon":{...}}
 ```
 
-`/health` does **not** touch the database or any upstream API, so a 200 here
-only means the web process is alive.
+`/health` **does** touch the database (it calls `store.health_check()` and
+reports the result under `"store"`) but does **not** call any external
+aviation upstream (AeroAPI, ADS-B, FAA feeds, etc.). A 200 here means the web
+process is alive and the store connection works — it does not prove the
+background tracker is making progress, that the SWIM daemon's JVM is
+connected, or that any upstream source is reachable. (Corrected from a
+previous version of this doc that said `/health` touches neither the
+database nor upstreams — that was inaccurate.)
 
 ---
 

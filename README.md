@@ -153,6 +153,23 @@ hardcoded in `swim_consumer.py`.
 
 ## Version history
 
+> **Note:** `/health` currently reports `"version": "1.8"`, but this list and
+> RORK_BRIEF.md had drifted to v1.3/v1.5 respectively, and v1.4–v1.7 were
+> never logged here. Rather than guess at unlogged history, this entry only
+> documents the fix made in this pass — please backfill v1.4–v1.7 from
+> memory/commit history if it matters, and bump `app.py`'s health-check
+> version string on every future change so this list and `/health` can't
+> drift again.
+
+- **v1.8** (current) — Fixed `/api/check` reading origin/destination from
+  the wrong envelope shape (it looked for a top-level `flights` key with
+  nested `code_icao` fields; the real shape is `data.flights[i].origin_icao`
+  / `dest_icao`), which had been silently skipping every airport-dependent
+  phase-2 task (METAR, TAF, FAA NAS, RVR, ops feeds) for every check. Also
+  renamed `swim-daemon.py` → `swim_daemon.py` (the code does `import
+  swim_daemon`, which cannot resolve a hyphenated filename) and added it to
+  the Dockerfile's `COPY` list, so the persistent SWIM daemon can actually
+  start in production instead of silently failing every boot.
 - **v1.3** — TFMS + TFDM SWIM feeds (GDP advisories, NAS positions, surface management)
 - **v1.2** — FAA SWIM integration (TBFM, SFDPS, ITWS, NOTAMs, STDDS)
 - **v1.1** — G-AIRMET, lightning, RVR, ATFM inference

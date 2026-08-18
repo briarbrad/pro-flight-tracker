@@ -1179,6 +1179,30 @@ def swim_tfdm():
 # UNIFIED FLIGHT CHECK — The main endpoint for the Rork app
 # ============================================================================
 
+def _extract_origin_dest_icao(status_data, status_code):
+    """Pull the origin/destination ICAO codes for the primary leg out of a
+    flight_data.cmd_status() envelope.
+
+    That envelope shape is {"data": {"flights": [...], "route": ...}, ...},
+    and each entry in data.flights is the FLATTENED dict produced by
+    flight_data._parse_aeroapi_flight(), which exposes flat "origin_icao"/
+    "dest_icao" keys (not nested origin/destination objects, and not a
+    "code_icao" field — see scripts/flight_data.py:_parse_aeroapi_flight).
+
+    Pulled out of check_flight() as its own pure function so it can be unit
+    tested directly (see tests/test_check_envelope.py) instead of only being
+    exercisable through a full, network-dependent /api/check request.
+    Returns (origin_icao, dest_icao), either of which may be None.
+    """
+    if status_code != 200 or not isinstance(status_data, dict):
+        return None, None
+    flights_list = (status_data.get("data") or {}).get("flights") or []
+    if not flights_list:
+        return None, None
+    first_leg = flights_list[0] or {}
+    return first_leg.get("origin_icao"), first_leg.get("dest_icao")
+
+
 @app.route("/api/check", methods=["GET", "POST"])
 def check_flight():
     """Run a comprehensive flight check — pulls ALL data sources in parallel.
@@ -1254,20 +1278,14 @@ def check_flight():
         timeout=20
     )
 
-    # Extract origin/dest airports from flight status
-    origin_icao = None
-    dest_icao = None
-    if status_code == 200 and isinstance(status_data, dict):
-        origin_icao = status_data.get("origin", {}).get("code_icao") or \
-                       status_data.get("origin_icao")
-        dest_icao = status_data.get("destination", {}).get("code_icao") or \
-                     status_data.get("destination_icao")
-
-        # Try alternate field names
-        if not origin_icao:
-            for f in status_data.get("flights", []):
-                origin_icao = origin_icao or f.get("origin", {}).get("code_icao")
-                dest_icao = dest_icao or f.get("destination", {}).get("code_icao")
+    # Extract origin/dest airports from flight status. See
+    # _extract_origin_dest_icao() for why this must read data.flights[0]
+    # with flat origin_icao/dest_icao keys rather than a top-level "flights"
+    # key with nested "code_icao" fields — the old version of this block used
+    # the latter, which don't exist anywhere in this envelope, so
+    # origin_icao/dest_icao were always None and every airport-dependent
+    # phase-2 task below was silently skipped.
+    origin_icao, dest_icao = _extract_origin_dest_icao(status_data, status_code)
 
     # Phase 2: Now build weather + ops tasks with known airports
     phase2_tasks = []

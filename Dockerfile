@@ -44,6 +44,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY store.py .
 COPY analysis.py .
+COPY swim_daemon.py .
 COPY scripts/ scripts/
 COPY swim/ swim/
 COPY references/ references/
