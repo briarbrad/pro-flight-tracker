@@ -16,6 +16,7 @@ All API keys are read from environment variables — never hardcoded.
 """
 
 import copy
+import hashlib
 import hmac
 import json
 import os
@@ -23,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -42,7 +45,20 @@ import aviation_weather as _mod_aviation_weather  # noqa: E402
 import airport_ops as _mod_airport_ops          # noqa: E402
 
 app = Flask(__name__)
-CORS(app)  # Allow Rork app to call from any origin
+
+# CORS is a browser-only mechanism — it has no effect on the native iOS
+# client (URLSession doesn't send an Origin header, so nothing here can ever
+# block or affect the app's own requests). It only matters for whether an
+# arbitrary website's JavaScript can call this API from a user's browser.
+# Default to allowing none; set ALLOWED_ORIGINS to a comma-separated list
+# (e.g. "https://example.com,https://admin.example.com") to permit specific
+# origins for a future web dashboard or admin tool.
+_allowed_origins = [o.strip() for o in
+                     os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _allowed_origins:
+    CORS(app, origins=_allowed_origins)
+else:
+    CORS(app, origins=[])  # no browser origin permitted by default
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -518,6 +534,27 @@ def _nocache_requested() -> bool:
     return has_request_context() and request.args.get("nocache") == "1"
 
 
+# Content keys that mean "this call returned something usable," scanned
+# across flight_data.py / aviation_weather.py / airport_ops.py response
+# shapes. A dispatch() call can embed an "error" key on a normal HTTP 200
+# (see e.g. scripts/airport_ops.py's lightning capture, which reports a
+# WebSocket error but still returns any strikes/ramp_alerts collected before
+# it dropped) — that is a degraded-but-useful response, not an outage, and
+# must not trip the breaker. Only a response that is error-and-nothing-else
+# should count as an upstream failure.
+_RESULT_CONTENT_KEYS = (
+    "data", "flights", "results", "route", "strikes", "ramp_alerts",
+    "conditions", "forecast", "advisories", "records", "position",
+)
+
+
+def _is_upstream_failure(data) -> bool:
+    """True when a 200 response is an error report with no usable payload."""
+    if not isinstance(data, dict) or "error" not in data:
+        return False
+    return not any(data.get(k) for k in _RESULT_CONTENT_KEYS)
+
+
 # --- Circuit breaker --------------------------------------------------------
 #
 # Per upstream, not per endpoint: when AeroAPI is down, every flight_data
@@ -606,11 +643,16 @@ def run_script(script: str, args: list, timeout: int = DEFAULT_TIMEOUT,
                          f"(circuit open after repeated failures)",
                 "retry_after_seconds": retry_in}, 503
 
-    # 3) Live fetch.
+    # 3) Live fetch. A 200 that's actually an embedded-error response (see
+    # _is_upstream_failure) must not read as breaker-success or get cached
+    # as if it were good data — previously it did both, which let a real
+    # provider outage look healthy and then get served back as "fresh"
+    # for the response's full TTL.
     data, status = _execute(script, args, timeout, env_extras)
-    _breaker_record(upstream, status == 200)
+    ok = status == 200 and not _is_upstream_failure(data)
+    _breaker_record(upstream, ok)
 
-    if status == 200:
+    if ok:
         _cache_put(key, data, status, _ttl_for(script, args, data))
         return data, status
 
@@ -839,7 +881,7 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.8",
+        "version": "1.9",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
@@ -1944,6 +1986,136 @@ def flight_brief():
     }), 200
 
 
+# ---------------------------------------------------------------------------
+# AI narrative proxy
+#
+# The client used to call Rork's AI toolkit directly from NarrativeService.
+# swift, sending `Bearer {RORK_TOOLKIT_SECRET_KEY}` from the device. That key
+# ships inside the compiled app bundle, so anyone who decompiles the IPA (or
+# just runs a proxy on the device and watches its own traffic) recovers a
+# live credential good against the account's Rork toolkit quota — completely
+# independent of anything this server's own auth/rate-limit gate does. This
+# endpoint moves the call server-side: the secret now lives only in Railway's
+# environment, and the client sends the same llm_payload it already computes
+# — just to this endpoint instead of straight to the toolkit.
+#
+# Response caching is keyed on a hash of the exact (system, user, facts)
+# tuple the client would have sent: two clients polling the same tracked
+# flight seconds apart produce byte-identical facts (same phase, verdict,
+# predicted times) and would otherwise pay for the same completion twice.
+# ---------------------------------------------------------------------------
+
+NARRATIVE_MODEL = "anthropic/claude-haiku-4.5"
+NARRATIVE_CACHE_TTL_SECONDS = max(
+    0, int(os.environ.get("NARRATIVE_CACHE_TTL_SECONDS", "180") or 180))
+NARRATIVE_CACHE_MAX_ENTRIES = 200
+
+_narrative_cache: dict[str, dict] = {}
+_narrative_cache_lock = threading.Lock()
+
+
+def _narrative_cache_key(system: str, user: str, facts) -> str:
+    blob = json.dumps({"system": system, "user": user, "facts": facts},
+                      sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _narrative_cache_get(key: str) -> str | None:
+    if NARRATIVE_CACHE_TTL_SECONDS <= 0:
+        return None
+    with _narrative_cache_lock:
+        entry = _narrative_cache.get(key)
+    if not entry:
+        return None
+    if time.monotonic() - entry["stored_at"] > NARRATIVE_CACHE_TTL_SECONDS:
+        return None
+    return entry["text"]
+
+
+def _narrative_cache_put(key: str, text: str) -> None:
+    if NARRATIVE_CACHE_TTL_SECONDS <= 0:
+        return
+    with _narrative_cache_lock:
+        _narrative_cache[key] = {"text": text, "stored_at": time.monotonic()}
+        while len(_narrative_cache) > NARRATIVE_CACHE_MAX_ENTRIES:
+            oldest = min(_narrative_cache,
+                        key=lambda k: _narrative_cache[k]["stored_at"])
+            del _narrative_cache[oldest]
+
+
+@app.route("/api/narrative", methods=["POST"])
+def api_narrative():
+    """Turn a brief's llm_payload into a short plain-English narrative.
+
+    Body: {"system": str, "user": str, "facts": <json>} — exactly the shape
+    of the `llm_payload` object /api/brief already returns, sent back
+    unmodified. Response: {"narrative": str, "cached": bool}.
+    """
+    toolkit_url = os.environ.get("RORK_TOOLKIT_URL", "").strip().rstrip("/")
+    toolkit_key = os.environ.get("RORK_TOOLKIT_SECRET_KEY", "").strip()
+    if not toolkit_url or not toolkit_key:
+        return jsonify({
+            "error": "AI narrative is not configured on the server",
+            "hint": "Set RORK_TOOLKIT_URL and RORK_TOOLKIT_SECRET_KEY on Railway "
+                    "(copy the values from Rork's project settings)",
+        }), 501
+
+    body = request.get_json(silent=True) or {}
+    system = (body.get("system") or "").strip()
+    user = (body.get("user") or "").strip()
+    facts = body.get("facts")
+    if not system or not user:
+        return jsonify({"error": "Both 'system' and 'user' are required"}), 400
+
+    cache_key = _narrative_cache_key(system, user, facts)
+    cached = _narrative_cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"narrative": cached, "cached": True}), 200
+
+    user_content = user
+    if facts is not None:
+        user_content += "\n" + json.dumps(facts, sort_keys=True, default=str)
+
+    try:
+        resp = requests.post(
+            f"{toolkit_url}/v2/vercel/v1/chat/completions",
+            json={
+                "model": NARRATIVE_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            },
+            headers={"Authorization": f"Bearer {toolkit_key}",
+                     "Content-Type": "application/json"},
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "error": f"Narrative service unreachable: {type(exc).__name__}",
+        }), 502
+
+    if resp.status_code != 200:
+        # Pass the toolkit's own status through — the client's NarrativeError
+        # already has copy for 401/402/429 and a generic fallback for others.
+        return jsonify({
+            "error": f"Narrative service error ({resp.status_code})",
+        }), resp.status_code
+
+    try:
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    except (ValueError, KeyError, IndexError, TypeError):
+        return jsonify({"error": "Narrative service returned an unexpected shape"}), 502
+
+    if not text:
+        return jsonify({"error": "The narrative came back empty"}), 502
+
+    _narrative_cache_put(cache_key, text)
+    return jsonify({"narrative": text, "cached": False}), 200
+
+
 # ============================================================================
 # BACKGROUND TRACKER THREAD
 # ============================================================================
@@ -2237,8 +2409,16 @@ def background_tracker():
                 new_risk = extract_risk_level(check_data)
                 old_risk = info.get("last_risk")
 
-                # Update tracking state
-                store.mark_checked(track_id, now, new_risk)
+                # Update tracking state. Re-derive the check cadence every
+                # pass instead of leaving it pinned to whatever the client
+                # requested at track-creation time: a flight still hours
+                # from departure doesn't need re-checking every 15 minutes,
+                # and one that's just started taxiing needs tighter cadence
+                # than any fixed default would give it.
+                next_interval = analysis.tracking_interval_minutes(
+                    horizon, tracked_phase)
+                store.mark_checked(track_id, now, new_risk,
+                                    interval_minutes=next_interval)
 
                 # Stop tracking once the flight is over.
                 finished = _flight_is_finished(

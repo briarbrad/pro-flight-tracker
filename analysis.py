@@ -1118,6 +1118,38 @@ def refresh_interval(phase: dict = None, horizon: dict = None):
     return _REFRESH_BY_BAND.get((horizon or {}).get("band"), 1800)
 
 
+# Bounds for the *background tracker's* self-adjusted polling cadence. Wider
+# than refresh_interval's own range on the slow end (up to 6h for a DISTANT
+# flight) since a client polling /api/brief only pays wall-clock time by
+# asking too often, but the tracker polling too often spends real AeroAPI
+# credit whether anyone is looking at the app or not. Never faster than 5
+# minutes regardless of phase — matches the floor already enforced on the
+# client-supplied interval at track-creation time.
+_TRACKER_INTERVAL_MIN_MINUTES = 5
+_TRACKER_INTERVAL_MAX_MINUTES = 360
+
+
+def tracking_interval_minutes(horizon: dict = None, phase: dict = None) -> int:
+    """How many minutes until the background tracker should check this
+    flight again, given where it is right now.
+
+    Built on refresh_interval's own phase/horizon bands so the tracker's
+    polling cadence and the client's own refresh_after_seconds hint always
+    agree about how urgent a given flight is — a flight still a day out get
+    checked roughly hourly, not every 15 minutes by default, while one
+    taxiing out gets checked every 5.
+    """
+    seconds = refresh_interval(phase, horizon)
+    if seconds is None:
+        # Finished/cancelled — caller removes the tracked flight before this
+        # would ever be used again, but fall back to the slow end just in
+        # case a stray call happens between "marked finished" and removal.
+        return _TRACKER_INTERVAL_MAX_MINUTES
+    minutes = max(1, round(seconds / 60))
+    return max(_TRACKER_INTERVAL_MIN_MINUTES,
+               min(_TRACKER_INTERVAL_MAX_MINUTES, minutes))
+
+
 def describe_position(track_payload, phase: dict = None) -> dict:
     """Turn a raw ADS-B/AeroAPI position into what the aircraft is doing.
 

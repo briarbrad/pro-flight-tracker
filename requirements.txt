@@ -19,5 +19,11 @@ requests>=2.31
 # Without it the app falls back to in-memory tracking automatically.
 psycopg[binary]>=3.2
 
+# Connection pooling for the Postgres store — without this every store call
+# (including the tracker's own per-flight loop) opens and closes a brand new
+# connection. store.py degrades gracefully to one-connection-per-call if
+# this package is ever missing, so it's an optional-but-recommended pin.
+psycopg_pool>=3.2
+
 # Async support for lightning WebSocket
 aiohttp>=3.9

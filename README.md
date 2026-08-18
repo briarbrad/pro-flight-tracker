@@ -61,7 +61,8 @@ Full reference with response shapes lives in [RORK_BRIEF.md](RORK_BRIEF.md).
 | FAA SWIM | `/api/swim/{tbfm,sfdps,itws,notams,stdds,tfms-flight,tfms-flow,tfdm}` | free | duration + ~4s |
 | Aggregate | `/api/check` | **AeroAPI** | 30–60s |
 | Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with phase + horizon |
-| Tracking | `/api/track` (POST/DELETE), `/api/tracked` | **AeroAPI** per interval | instant |
+| Narrative | `/api/narrative` | Rork AI toolkit (server-side) | 1–5s, cached briefly |
+| Tracking | `/api/track` (POST/DELETE), `/api/tracked` | **AeroAPI** per interval, cadence adapts to phase | instant |
 
 Only the AeroAPI-backed endpoints cost money. Weather, airport ops, and all
 eight SWIM feeds are free to call as often as useful.
@@ -135,6 +136,12 @@ pro-flight-tracker/
 | `OPENSKY_API_KEY` | optional | Fallback position, `username:password` |
 | `WEATHER_USER_AGENT` | optional | UA string for weather APIs |
 | `DISABLE_TRACKER` | optional | Set `1` to stop background polling without a code deploy |
+| `DB_POOL_MAX_SIZE` | optional | Max pooled Postgres connections (default `10`) |
+| `ALLOWED_ORIGINS` | optional | Comma-separated browser origins allowed to call the API cross-origin. Empty (default) allows none. Purely a browser-side CORS control — it has no effect on the native iOS client, which never sends an `Origin` header |
+| `RORK_TOOLKIT_URL` | required for `/api/narrative` | Base URL of Rork's AI toolkit (copy from Rork project settings) |
+| `RORK_TOOLKIT_SECRET_KEY` | required for `/api/narrative` | Server-side secret for the toolkit call. Without both this and `RORK_TOOLKIT_URL`, `/api/narrative` returns `501` and the client should fall back to its deterministic verdict with no AI narrative |
+| `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling the toolkit again (default `180`, `0` disables caching) |
+| `API_TOKEN` / `REQUIRE_AUTH` | optional | Bearer-token auth, dormant until `REQUIRE_AUTH=1` is set (see `app.py`'s auth section for the rollout sequence). `API.swift` already sends `Config.EXPO_PUBLIC_BACKEND_API_TOKEN` as a bearer token when configured, so enabling this needs no new iOS code — only matching values on both sides |
 
 SWIM usernames, queue names, and broker assignments live in `swim/config.json`,
 not in env vars.
@@ -153,7 +160,7 @@ hardcoded in `swim_consumer.py`.
 
 ## Version history
 
-> **Note:** `/health` currently reports `"version": "1.8"`, but this list and
+> **Note:** `/health` currently reports `"version": "1.8"` in some older deploys, but this list and
 > RORK_BRIEF.md had drifted to v1.3/v1.5 respectively, and v1.4–v1.7 were
 > never logged here. Rather than guess at unlogged history, this entry only
 > documents the fix made in this pass — please backfill v1.4–v1.7 from
@@ -161,7 +168,26 @@ hardcoded in `swim_consumer.py`.
 > version string on every future change so this list and `/health` can't
 > drift again.
 
-- **v1.8** (current) — Fixed `/api/check` reading origin/destination from
+- **v1.9** (current) — Backend hardening pass:
+  - Circuit breaker now inspects the response body, not just HTTP status —
+    a `200` that's actually a bare `{"error": ...}` with no usable content
+    (a real upstream failure some provider scripts can return) used to read
+    as success and even get cached as good data. Fixed both.
+  - Background tracker's polling cadence is now phase/horizon-aware instead
+    of fixed at track-creation time — a flight a day out polls roughly
+    hourly-to-6-hourly instead of every 15 minutes; one taxiing out tightens
+    to every 5.
+  - Added Postgres connection pooling (`psycopg_pool`) — every store call
+    used to open and close a brand new connection, including from the
+    tracker's own per-flight loop.
+  - `CORS(app)` (wide open) replaced with an explicit `ALLOWED_ORIGINS`
+    allowlist, default-deny. This is a browser-only control with zero effect
+    on the native iOS client.
+  - Added `/api/narrative`, a server-side proxy for the AI narrative call.
+    The client used to call Rork's AI toolkit directly with a secret baked
+    into the app bundle; the secret now lives only in Railway's environment,
+    with response caching to cut redundant LLM spend.
+- **v1.8** — Fixed `/api/check` reading origin/destination from
   the wrong envelope shape (it looked for a top-level `flights` key with
   nested `code_icao` fields; the real shape is `data.flights[i].origin_icao`
   / `dest_icao`), which had been silently skipping every airport-dependent

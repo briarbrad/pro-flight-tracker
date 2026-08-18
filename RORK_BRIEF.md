@@ -208,7 +208,24 @@ for that feed.
 | `/api/track` | `DELETE` | Query: `flight`, `date` |
 | `/api/tracked` | `GET` | — |
 
+`interval_minutes` on `POST /api/track` only sets the *starting* cadence.
+The background tracker re-derives it every check from the flight's current
+phase and horizon (see §6) — it tightens automatically near departure/taxi
+and loosens automatically while a flight is still hours out, so don't expect
+the interval you requested to stay fixed for the life of the tracked flight.
+
 See §6.
+
+---
+
+### Narrative
+
+| Endpoint | Method | Params |
+|---|---|---|
+| `/api/narrative` | `POST` | JSON body: `system`, `user`, `facts` — pass `llm_payload` from `/api/brief` straight through |
+
+See §4b “Using `llm_payload`” for the full contract and why this replaced a
+direct client-to-AI-provider call.
 
 ---
 
@@ -591,28 +608,49 @@ The `position` lookup adds one query only when ADS-B **and** OpenSky both
 miss; it reuses the already-paid flight status, so the fallback costs one
 query rather than two.
 
-### Using `llm_payload`
+### Using `llm_payload` — call `/api/narrative`, not the model directly
 
-Send it to whatever model you like. All arithmetic is already done; the model
-only writes prose about numbers computed here.
+All arithmetic is already done in `llm_payload`; a model only writes prose
+about numbers computed here. **Send `llm_payload` to this backend's own
+`/api/narrative` endpoint** rather than calling an AI provider directly from
+the client:
 
 ```js
 const brief = await fetch(`${BASE}/api/brief?flight=${flight}`).then(r => r.json());
 const { system, user, facts } = brief.llm_payload;
 
-const narrative = await callYourModel({
-  system,
-  user: user + JSON.stringify(facts, null, 2),
-});
+const { narrative } = await fetch(`${BASE}/api/narrative`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ system, user, facts }),
+}).then(r => r.json());
 ```
+
+`POST /api/narrative` — body `{system, user, facts}` (exactly the shape of
+`llm_payload`, sent back unmodified) — returns `{"narrative": string,
+"cached": bool}` on success. `cached: true` means an identical
+(system, user, facts) tuple was answered recently and no new model call was
+made — expect this often when several clients poll the same tracked flight
+within a few minutes of each other.
+
+**Why not call the AI provider straight from the app:** the previous
+approach embedded a provider secret key in the compiled app bundle and sent
+it from the device on every call. That key is recoverable by decompiling the
+IPA or watching the device's own traffic — completely independent of
+anything the backend's own auth does. `/api/narrative` keeps that credential
+server-side only; the client never sees it. If `RORK_TOOLKIT_URL` /
+`RORK_TOOLKIT_SECRET_KEY` aren't configured on the server, the endpoint
+returns `501` — treat that the same as any other narrative failure and fall
+back to the deterministic verdict with no AI text (see `NarrativeError` in
+the client for the existing pattern).
 
 `system` embeds the full analytical framework plus five guardrails — chiefly
 "every number must come from the facts provided" and "sources marked
 not_consulted were deliberately excluded; do not speculate about them."
 
 Render `verdict` and `branch_classification` directly from the JSON. Use the
-model only for the narrative — that way the numbers on screen are always the
-deterministic ones, even if the model output is slow or fails.
+narrative only for prose — that way the numbers on screen are always the
+deterministic ones, even if the narrative call is slow or fails.
 
 ---
 
@@ -678,8 +716,15 @@ Content-Type: application/json
 
 - `track_id` is always `"{flight}_{date}"`. Re-POSTing the same pair **updates**
   the existing record rather than creating a duplicate.
-- `interval_minutes` is **clamped to 5–240**. Values outside that range are
-  silently adjusted, so read back what the response reports.
+- `interval_minutes` is **clamped to 5–240** at creation time. Values outside
+  that range are silently adjusted, so read back what the response reports.
+- **This is only the starting cadence.** After the first check, the tracker
+  recomputes the interval itself on every pass from the flight's current
+  phase/horizon (the same bands `refresh_after_seconds` in `/api/brief` uses)
+  and can widen it up to 360 minutes for a flight still far out, or tighten
+  it down to 5 minutes once it's taxiing — independent of what was requested
+  at creation. `GET /api/tracked` always reflects the current, possibly
+  auto-adjusted value.
 - `push_token` is required by the endpoint but never validated. A malformed
   token fails silently at notification time.
 

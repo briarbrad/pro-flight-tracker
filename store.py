@@ -33,15 +33,65 @@ _LEADER_LOCK_FILE = "/tmp/pft-tracker.lock"
 DEFAULT_TTL_HOURS = 36
 
 _psycopg = None
+_ConnectionPool = None
 if DATABASE_URL:
     try:
         import psycopg as _psycopg  # noqa: F401
     except ImportError:
         _psycopg = None
+    try:
+        from psycopg_pool import ConnectionPool as _ConnectionPool  # noqa: F401
+    except ImportError:
+        _ConnectionPool = None  # falls back to one connection per call below
+
+_pool = None
+_pool_lock = threading.Lock()
 
 
 def using_postgres() -> bool:
     return bool(DATABASE_URL and _psycopg is not None)
+
+
+def _get_pool():
+    """Lazily create the shared connection pool.
+
+    Every store function used to open (and TCP/TLS-handshake, then close) a
+    brand new Postgres connection on every single call — including from the
+    tracker loop's tight per-flight iteration and every request handler.
+    Under any real concurrency that's the classic way to exhaust Postgres's
+    own max_connections long before the app's own load limit. A pool keeps a
+    small set of warm connections and hands them out/back, so a normal
+    request pays a Python-level checkout instead of a fresh network
+    round-trip and auth handshake.
+    """
+    global _pool
+    if _pool is not None or not using_postgres() or _ConnectionPool is None:
+        return _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = _ConnectionPool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
+                timeout=10,       # seconds to wait for a free connection
+                max_idle=300,     # recycle idle connections after 5 min
+                open=True,
+            )
+    return _pool
+
+
+def _connect(connect_timeout: int = None):
+    """Return something usable as `with _connect() as conn:`.
+
+    Prefers a pooled connection; falls back to a direct one-off connect if
+    psycopg_pool isn't installed or the pool hasn't come up yet, so this is
+    a strict improvement with no new hard dependency at import time.
+    """
+    pool = _get_pool()
+    if pool is not None:
+        return pool.connection()
+    kwargs = {"connect_timeout": connect_timeout} if connect_timeout else {}
+    return _psycopg.connect(DATABASE_URL, **kwargs)
 
 
 def backend_name() -> str:
@@ -66,7 +116,7 @@ def health_check() -> dict:
         info["ok"] = not (DATABASE_URL and _psycopg is None)
         return info
     try:
-        with _psycopg.connect(DATABASE_URL, connect_timeout=3) as conn:
+        with _connect(connect_timeout=3) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
@@ -197,7 +247,7 @@ def init() -> None:
     if not using_postgres():
         return
     try:
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
                 cur.execute(EDCT_SCHEMA)
@@ -220,7 +270,7 @@ def add(track_id: str, flight: str, date: str, push_token: str,
     expires_at = now + timedelta(hours=ttl_hours)
 
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -264,7 +314,7 @@ def add(track_id: str, flight: str, date: str, push_token: str,
 def remove(track_id: str) -> bool:
     """Stop tracking. Returns True if something was removed."""
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM tracked_flights WHERE track_id = %s",
                             (track_id,))
@@ -279,7 +329,7 @@ def remove(track_id: str) -> bool:
 def list_all() -> list[dict]:
     """Every tracked flight, newest first."""
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT {_COLS} FROM tracked_flights "
                             "ORDER BY created_at DESC")
@@ -299,7 +349,7 @@ def due_for_check(now: datetime = None) -> list[dict]:
     now = now or _now()
 
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -330,16 +380,32 @@ def due_for_check(now: datetime = None) -> list[dict]:
     return due
 
 
-def mark_checked(track_id: str, when: datetime, risk: str) -> None:
-    """Record that a check just ran."""
+def mark_checked(track_id: str, when: datetime, risk: str,
+                  interval_minutes: int = None) -> None:
+    """Record that a check just ran.
+
+    interval_minutes, when given, replaces the flight's stored check
+    interval so the *next* due_for_check() cadence reflects how urgent the
+    flight actually is right now (e.g. tighten near boarding/taxi, loosen
+    while it's still hours from departure) instead of staying pinned to
+    whatever interval the client happened to request at track-creation time.
+    """
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE tracked_flights SET last_check = %s, last_risk = %s "
-                    "WHERE track_id = %s",
-                    (when, risk, track_id),
-                )
+                if interval_minutes is not None:
+                    cur.execute(
+                        "UPDATE tracked_flights SET last_check = %s, "
+                        "last_risk = %s, interval_minutes = %s "
+                        "WHERE track_id = %s",
+                        (when, risk, interval_minutes, track_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE tracked_flights SET last_check = %s, "
+                        "last_risk = %s WHERE track_id = %s",
+                        (when, risk, track_id),
+                    )
             conn.commit()
         return
 
@@ -347,6 +413,8 @@ def mark_checked(track_id: str, when: datetime, risk: str) -> None:
         if track_id in _mem:
             _mem[track_id]["last_check"] = _iso(when)
             _mem[track_id]["last_risk"] = risk
+            if interval_minutes is not None:
+                _mem[track_id]["interval_minutes"] = interval_minutes
 
 
 def purge_expired(now: datetime = None) -> int:
@@ -354,7 +422,7 @@ def purge_expired(now: datetime = None) -> int:
     now = now or _now()
 
     if using_postgres():
-        with _psycopg.connect(DATABASE_URL) as conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM tracked_flights "
                             "WHERE expires_at IS NOT NULL AND expires_at <= %s",
@@ -402,7 +470,7 @@ def cache_edct(flight: str, date: str, edct: dict) -> None:
     if using_postgres():
         try:
             import json as _json
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.execute(EDCT_SCHEMA)  # lazy-create: non-leader workers
                     cur.execute(
@@ -431,7 +499,7 @@ def get_cached_edct(flight: str, date: str) -> dict | None:
     if using_postgres():
         try:
             import json as _json
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT payload, updated_at FROM edct_cache "
@@ -507,7 +575,7 @@ def swim_record_events(feed: str, records: list) -> None:
         return
     if using_postgres():
         try:
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.executemany(
                         "INSERT INTO swim_events "
@@ -545,7 +613,7 @@ def swim_recent_events(feed: str, window_seconds: int = 900,
     raw = []
     if using_postgres():
         try:
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT payload FROM swim_events "
@@ -599,7 +667,7 @@ def swim_daemon_heartbeat(queue_name: str, messages_delta: int = 0,
     now = _now()
     if using_postgres():
         try:
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO swim_daemon_status "
@@ -640,7 +708,7 @@ def swim_daemon_health(queue_name: str) -> dict:
     row = None
     if using_postgres():
         try:
-            with _psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            with _connect(connect_timeout=5) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT last_alive_at, last_message_at, messages_total, "
