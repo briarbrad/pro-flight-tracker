@@ -543,7 +543,9 @@ def _analyze_turn_time(outbound, inbound, aircraft_type):
             "inbound_eta": inbound_eta_str,
             "outbound_scheduled_departure": outbound.get("scheduled_out"),
             "inbound_flight_id": inbound.get("fa_flight_id"),
-            "inbound_ident": inbound.get("ident"), "note": note}
+            "inbound_ident": inbound.get("ident"),
+            "inbound_registration": inbound.get("registration"),
+            "note": note}
 
 # ---------------------------------------------------------------------------
 def build_parser():

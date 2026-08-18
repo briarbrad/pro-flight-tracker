@@ -201,6 +201,19 @@ CREATE TABLE IF NOT EXISTS edct_cache (
 );
 """
 
+# Turn-time/equipment-chain findings (see cache_turn_analysis below) reuse
+# the exact same shape as EDCT caching, so the schema is identical bar the
+# table name.
+TURN_ANALYSIS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS turn_analysis_cache (
+    flight       TEXT NOT NULL,
+    flight_date  TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (flight, flight_date)
+);
+"""
+
 SWIM_SCHEMA = """
 CREATE TABLE IF NOT EXISTS swim_events (
     id           BIGSERIAL PRIMARY KEY,
@@ -662,6 +675,109 @@ def get_cached_edct(flight: str, date: str) -> dict | None:
         if not entry:
             fkey = _edct_key(flight, date)[0]
             candidates = [(k, e) for k, e in _edct_mem.items() if k[0] == fkey]
+            if candidates:
+                entry = max(candidates, key=lambda kv: _iso(kv[1]["updated_at"]))[1]
+    if not entry:
+        return None
+    if _parse(entry["updated_at"]) < cutoff:
+        return None
+    return {"payload": dict(entry["payload"]), "cached_at": _iso(entry["updated_at"])}
+
+
+# ---------------------------------------------------------------------------
+# Turn-time / equipment-chain caching
+#
+# The equipment_chain lookup (inbound aircraft + turn-time math) is the
+# single most predictive signal the app computes, but it costs 2 AeroAPI
+# queries and only ever ran from /api/brief on a manual tap. That meant:
+# the cheap /api/flight/live tile could show a live delay while its own
+# "no single cause was identified" note was true only because /live never
+# looked. Same fix shape as EDCT caching above: the brief caches what it
+# found here, keyed on whether it was actually a binding constraint, and
+# /live (and the tracker's background poll) re-attach it cheaply instead
+# of staying blind to a finding that already exists.
+# ---------------------------------------------------------------------------
+
+TURN_ANALYSIS_TTL_MINUTES = 30
+
+_turn_mem: dict[tuple, dict] = {}
+
+
+def _turn_key(flight: str, date: str) -> tuple:
+    return ((flight or "").upper(), date or "")
+
+
+def cache_turn_analysis(flight: str, date: str, turn_analysis: dict) -> None:
+    """Persist a turn-time finding found by the brief. Ignored if empty.
+
+    Best-effort: a failure here must never break the brief response.
+    """
+    if not turn_analysis or turn_analysis.get("turn_time_available_min") is None:
+        return
+    now = _now()
+    if using_postgres():
+        try:
+            import json as _json
+            with _connect(connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(TURN_ANALYSIS_SCHEMA)  # lazy-create
+                    cur.execute(
+                        "INSERT INTO turn_analysis_cache "
+                        "(flight, flight_date, payload, updated_at) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (flight, flight_date) DO UPDATE "
+                        "SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+                        (_turn_key(flight, date)[0], date,
+                         _json.dumps(turn_analysis), now))
+                conn.commit()
+            return
+        except Exception:
+            pass  # fall through to memory so at least this worker remembers
+    with _mem_lock:
+        _turn_mem[_turn_key(flight, date)] = {"payload": dict(turn_analysis),
+                                              "updated_at": now}
+
+
+def get_cached_turn_analysis(flight: str, date: str) -> dict | None:
+    """Return {"payload": {...}, "cached_at": iso} if a fresh entry exists.
+
+    Entries older than TURN_ANALYSIS_TTL_MINUTES are treated as absent — the
+    inbound aircraft's own ETA moves, so a stale turn-time verdict is worse
+    than none. The TTL is shorter than EDCT's because turn time changes
+    continuously as the inbound flight progresses, where an EDCT is a fixed
+    slot until FAA traffic management revises it.
+    """
+    cutoff = _now() - timedelta(minutes=TURN_ANALYSIS_TTL_MINUTES)
+    if using_postgres():
+        try:
+            import json as _json
+            with _connect(connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload, updated_at FROM turn_analysis_cache "
+                        "WHERE flight = %s AND flight_date = %s",
+                        _turn_key(flight, date))
+                    row = cur.fetchone()
+                    if not row:
+                        cur.execute(
+                            "SELECT payload, updated_at FROM turn_analysis_cache "
+                            "WHERE flight = %s ORDER BY updated_at DESC LIMIT 1",
+                            (_turn_key(flight, date)[0],))
+                        row = cur.fetchone()
+            if not row:
+                return None
+            payload, updated_at = row
+            updated_at = _parse(updated_at)
+            if not updated_at or updated_at < cutoff:
+                return None
+            return {"payload": _json.loads(payload), "cached_at": _iso(updated_at)}
+        except Exception:
+            return None
+    with _mem_lock:
+        entry = _turn_mem.get(_turn_key(flight, date))
+        if not entry:
+            fkey = _turn_key(flight, date)[0]
+            candidates = [(k, e) for k, e in _turn_mem.items() if k[0] == fkey]
             if candidates:
                 entry = max(candidates, key=lambda kv: _iso(kv[1]["updated_at"]))[1]
     if not entry:

@@ -1643,14 +1643,25 @@ def flight_live():
                                        now)
     taxi = analysis.analyze_taxi(primary, phase, predictions, now)
 
+    # Turn-time/equipment: never looked up here either (2 extra AeroAPI
+    # queries), but re-attach a fresh finding from the last brief so this
+    # tile can't contradict itself — previously this was always {}, so the
+    # "no single cause was identified" note was true only because /live
+    # had never checked, even when a brief had already found one minutes
+    # earlier. Unlike EDCT this doesn't need an opt-in query param: it's
+    # a cache read, not extra cost, so there's no reason to gate it.
+    cached_turn = store.get_cached_turn_analysis(flight, date)
+    turn_analysis = cached_turn["payload"] if cached_turn else {}
+
     # Verdict-lite: same assess() as the brief, fed only status-derived
-    # inputs — no FAA programs, no weather effects, no turn analysis.
+    # inputs — no FAA programs, no weather effects, and turn analysis only
+    # when a recent brief already found one (see cached_turn above).
     plan = analysis.source_plan(horizon["hours_to_next_event"], phase)
-    branch = analysis.classify_branch(horizon, [], {}, plan, [])
-    effects = (analysis.build_effects(primary, [], {}, edct, horizon)
+    branch = analysis.classify_branch(horizon, [], turn_analysis, plan, [])
+    effects = (analysis.build_effects(primary, [], turn_analysis, edct, horizon)
                + analysis.taxi_effects(taxi, edct))
-    verdict = analysis.assess(horizon, branch, {}, primary, effects, taxi,
-                              phase)
+    verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects,
+                              taxi, phase)
     verdict["scope"] = "status_only"
 
     _sev = {"ACTION": 0, "WATCH": 1, "INFO": 2}
@@ -1671,7 +1682,16 @@ def flight_live():
         "predicted_times": predictions,
         "timezones": {"origin": origin_tz, "destination": dest_tz},
         "edct_cache": edct_cache_info,
-        "delay_trend": _delay_trend_payload(flight, date),
+        "turn_analysis_cache": ({"attached": True,
+                                "cached_at": cached_turn["cached_at"],
+                                "ttl_minutes": store.TURN_ANALYSIS_TTL_MINUTES}
+                               if cached_turn else
+                               {"attached": False,
+                                "note": "No fresh cached turn-time finding — "
+                                        "run a brief to check inbound "
+                                        "equipment"}),
+        "delay_trend": _record_and_get_delay_trend(flight, date, primary,
+                                                    verdict.get("departure_risk")),
         "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
         "aeroapi_queries_used": 1,
     }), 200
@@ -1835,6 +1855,11 @@ def flight_brief():
             sources["equipment_chain"] = {"status": "ok", "relevance": "PRIMARY",
                                           "provides": plan["equipment_chain"]["provides"],
                                           "data": inner}
+            # Write-through so /api/flight/live (which never affords this
+            # lookup itself) and the tracker's background poll can re-attach
+            # this finding instead of staying blind to it — same pattern as
+            # the EDCT write-through a few lines below.
+            store.cache_turn_analysis(flight, date, turn_analysis)
         else:
             sources["equipment_chain"] = {"status": "error", "relevance": "PRIMARY",
                                           "error": chain_data}
@@ -1867,6 +1892,19 @@ def flight_brief():
     # --- Step 5: deterministic analysis.
     origin_tz = analysis.resolve_timezone(origin, primary.get("origin_timezone"))
     dest_tz = analysis.resolve_timezone(dest, primary.get("dest_timezone"))
+
+    # Ground the equipment/turn-time facts in real clock times now that the
+    # origin timezone is known. The inbound flight lands at THIS flight's
+    # origin airport, so origin_tz is correct for both timestamps. Without
+    # this, the facts only ever carried relative minute deltas — leaving the
+    # LLM nothing to cite but a blank, which it was filling in with
+    # invented clock times (see the new SYNTHESIS_RULES entry).
+    if turn_analysis.get("inbound_eta"):
+        turn_analysis["inbound_eta_local"] = analysis.to_local(
+            turn_analysis["inbound_eta"], origin_tz)["display"]
+    if turn_analysis.get("outbound_scheduled_departure"):
+        turn_analysis["outbound_scheduled_departure_local"] = analysis.to_local(
+            turn_analysis["outbound_scheduled_departure"], origin_tz)["display"]
 
     programs = analysis._programs_from_faa(
         (sources.get("faa_status") or {}).get("data"))
@@ -1982,7 +2020,8 @@ def flight_brief():
         "sources_excluded": excluded,
         "sources": sources,
         "llm_payload": payload,
-        "delay_trend": _delay_trend_payload(flight, date),
+        "delay_trend": _record_and_get_delay_trend(flight, date, primary,
+                                                    verdict.get("departure_risk")),
         "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
         "aeroapi_queries_used": aeroapi_queries,
     }), 200
@@ -2235,6 +2274,31 @@ def _snapshot_fields(flight: dict):
             round(delta, 1) if delta is not None else None)
 
 
+def _record_and_get_delay_trend(flight: str, date: str, primary: dict,
+                               risk: str) -> dict | None:
+    """Write a snapshot from THIS request's own live data, then read back
+    the trend series.
+
+    Previously delay_trend only ever reflected the separate background
+    tracker's own polling cadence, completely decoupled from whatever live
+    status this same request just fetched for the hero tile. That let the
+    trend history show "0 -> 0 -> 0 -> 0, holding steady" on the exact same
+    screen as a tile already showing a live +30 min delay, whenever the
+    tracker's own next scheduled check hadn't landed yet. Recording a
+    snapshot here — from data already in hand, so it costs nothing extra —
+    means the trend can never be staler than the screen it sits on.
+    """
+    try:
+        track_id = f"{flight}_{date}"
+        snap_out, snap_in, snap_delta = _snapshot_fields(primary)
+        store.record_snapshot(track_id, datetime.now(timezone.utc),
+                              predicted_out=snap_out, predicted_in=snap_in,
+                              delta_minutes=snap_delta, risk=risk)
+    except Exception:
+        pass  # trend data is an enhancement, never worth failing the request
+    return _delay_trend_payload(flight, date)
+
+
 def _delay_trend_payload(flight: str, date: str) -> dict | None:
     """delay_trend block for the brief/live envelopes, or None.
 
@@ -2318,6 +2382,23 @@ def extract_risk_level(check_data: dict) -> str:
             if delay >= 45:
                 risk = _escalate(risk, "HIGH")
             elif delay >= 15:
+                risk = _escalate(risk, "MODERATE")
+
+    # ---- Equipment/turn-time (structural, not weather) ------------------
+    # This is what lets risk escalate — and therefore an alert fire — BEFORE
+    # the airline's own estimate has moved at all: a binding turn-time
+    # deficit guarantees a slip regardless of what estimated_out currently
+    # says. Mirrors the same thresholds assess() uses for the on-demand
+    # brief, so the tracker's judgment can't disagree with the brief's.
+    turn_analysis = data.get("turn_analysis")
+    if isinstance(turn_analysis, dict):
+        available = turn_analysis.get("turn_time_available_min")
+        minimum = turn_analysis.get("turn_time_required_min_minimum")
+        standard = turn_analysis.get("turn_time_required_min_standard")
+        if available is not None and minimum is not None:
+            if available < minimum:
+                risk = _escalate(risk, "HIGH")
+            elif standard and available < standard:
                 risk = _escalate(risk, "MODERATE")
 
     # ---- TFMS flow advisories (ground stops / GDP issuances) -----------
@@ -2461,6 +2542,48 @@ def background_tracker():
                     }], max_workers=1)
                     results.update(faa)
 
+                # Phase 3 — equipment/turn-time. This is the single most
+                # predictive signal the app computes ("the aircraft
+                # physically cannot turn around in time"), but it used to
+                # only ever run on a manual /api/brief tap — meaning even a
+                # binding equipment constraint sitting there for hours could
+                # never raise risk or fire an alert on its own. Reuse a
+                # fresh cached finding for free first (e.g. from a brief the
+                # user already ran); only pay for a fresh lookup (2 AeroAPI
+                # queries) when there's no fresh cache AND the horizon says
+                # it's still knowable pre-pushback — same window /api/brief
+                # itself gates on, so this can't get expensive far out.
+                turn_analysis = {}
+                if plan["equipment_chain"]["relevant"]:
+                    cached_turn = store.get_cached_turn_analysis(flight, date)
+                    if cached_turn:
+                        turn_analysis = cached_turn["payload"]
+                    else:
+                        chain_data, chain_code = run_script(
+                            "flight_data.py",
+                            ["chain", "--flight", flight, "--date", date],
+                            timeout=30)
+                        if chain_code == 200 and isinstance(chain_data, dict):
+                            inner = chain_data.get("data") or {}
+                            turn_analysis = inner.get("turn_analysis") or {}
+                            # Same local-time grounding /api/brief applies —
+                            # a cache entry written from here must be just
+                            # as citable as one written from a manual brief,
+                            # or the narrative guardrail has a hole again.
+                            tracker_origin_tz = analysis.resolve_timezone(
+                                primary.get("origin_icao"),
+                                primary.get("origin_timezone"))
+                            if turn_analysis.get("inbound_eta"):
+                                turn_analysis["inbound_eta_local"] = (
+                                    analysis.to_local(turn_analysis["inbound_eta"],
+                                                      tracker_origin_tz)["display"])
+                            if turn_analysis.get("outbound_scheduled_departure"):
+                                turn_analysis["outbound_scheduled_departure_local"] = (
+                                    analysis.to_local(
+                                        turn_analysis["outbound_scheduled_departure"],
+                                        tracker_origin_tz)["display"])
+                            store.cache_turn_analysis(flight, date, turn_analysis)
+
                 # Drop anything the horizon says is not decision-relevant so
                 # it cannot drive an alert.
                 relevance = {"flight_status": True,
@@ -2470,6 +2593,7 @@ def background_tracker():
                     k: v["data"] for k, v in results.items()
                     if relevance.get(k, True)
                 }}
+                check_data["data"]["turn_analysis"] = turn_analysis
 
                 new_risk = extract_risk_level(check_data)
                 old_risk = info.get("last_risk")

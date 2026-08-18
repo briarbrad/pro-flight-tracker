@@ -462,6 +462,35 @@ def _reason_is_weather(reason: str) -> bool:
     return any(term in r for term in _WEATHER_REASONS)
 
 
+def _turn_identity_clause(turn_analysis: dict) -> str:
+    """Optional grounded clause naming the inbound aircraft and its real
+    clock times, built ONLY from fields actually present in turn_analysis.
+
+    Exists so the LLM has real specifics to cite for the equipment/turn-time
+    mechanism instead of an empty vacuum — the vacuum is what it was
+    previously filling in with fabricated clock times and tail numbers.
+    Returns "" when none of the identifying fields are available, so callers
+    can simply concatenate it without a None check.
+    """
+    if not isinstance(turn_analysis, dict):
+        return ""
+    ident = turn_analysis.get("inbound_ident")
+    reg = turn_analysis.get("inbound_registration")
+    inbound_time = turn_analysis.get("inbound_eta_local")
+    outbound_time = turn_analysis.get("outbound_scheduled_departure_local")
+    if not (ident or inbound_time):
+        return ""
+    who = ident or "The inbound aircraft"
+    if reg:
+        who += f" ({reg})"
+    parts = [who]
+    if inbound_time:
+        parts.append(f"is due in at {inbound_time}")
+    if outbound_time:
+        parts.append(f"and this aircraft is scheduled out at {outbound_time}")
+    return " " + " ".join(parts) + "."
+
+
 def classify_branch(horizon: dict, programs: list, turn_analysis: dict,
                     plan: dict, weather_effects: list = None) -> dict:
     """Apply the Branch A / Branch B methodology.
@@ -489,6 +518,7 @@ def classify_branch(horizon: dict, programs: list, turn_analysis: dict,
                     f"{minimum} min minimum for a "
                     f"{turn_analysis.get('aircraft_category', 'unknown')} — "
                     "equipment is the binding constraint (Branch B)."
+                    + _turn_identity_clause(turn_analysis)
                 )
             else:
                 evidence.append(
@@ -720,6 +750,15 @@ SYNTHESIS_RULES = [
     "in the narrative — the reader is a traveller, not a dispatcher. If a "
     "`local_display` shows a Z suffix the timezone was unresolved; say the "
     "time is UTC rather than inventing a local conversion.",
+    "For an equipment/turn-time mechanism (Branch B), you may only cite: "
+    "the turn-time minutes and minimum/standard thresholds already stated in "
+    "the facts, and — only if present in the facts — the inbound flight's "
+    "identifier, registration, or a `_local` clock-time string. Never invent "
+    "a specific clock time (e.g. 'landed at 9:14 PM'), a tail number, or any "
+    "minute figure beyond what is explicitly given. If no inbound identifier "
+    "or local clock time is present in the facts, describe the mechanism in "
+    "relative terms only ('the inbound aircraft', 'X minutes short') rather "
+    "than fabricating specifics to sound more precise.",
 ]
 
 
@@ -970,7 +1009,8 @@ def build_effects(flight: dict, programs: list, turn_analysis: dict,
                 shortfall = int(minimum - avail)
                 effects.append({
                     "cause": f"Inbound aircraft leaves only {avail:.0f} min "
-                             f"of turn time ({cat} minimum: {minimum} min)",
+                             f"of turn time ({cat} minimum: {minimum} min)."
+                             + _turn_identity_clause(turn_analysis),
                     "effect": f"Departure is effectively guaranteed to slip "
                               f"by at least ~{shortfall} min — the aircraft "
                               "physically cannot turn faster than the minimum.",
