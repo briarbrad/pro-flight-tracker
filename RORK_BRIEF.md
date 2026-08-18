@@ -224,8 +224,13 @@ See §6.
 |---|---|---|
 | `/api/narrative` | `POST` | JSON body: `system`, `user`, `facts` — pass `llm_payload` from `/api/brief` straight through |
 
-See §4b “Using `llm_payload`” for the full contract and why this replaced a
-direct client-to-AI-provider call.
+See §4b “Using `llm_payload`” for the full contract. **Note:** this endpoint
+is currently dormant — `RORK_TOOLKIT_URL`/`RORK_TOOLKIT_SECRET_KEY` aren't
+set on the server (Rork's toolkit credential isn't exposed for copying out
+of Rork's Secrets UI on our plan), so it always returns `501` today. The
+shipped app keeps calling Rork's hosted AI toolkit directly, as originally
+built — do not point `NarrativeService.swift` at this endpoint unless the
+server side gets configured with a real provider key first.
 
 ---
 
@@ -608,12 +613,18 @@ The `position` lookup adds one query only when ADS-B **and** OpenSky both
 miss; it reuses the already-paid flight status, so the fallback costs one
 query rather than two.
 
-### Using `llm_payload` — call `/api/narrative`, not the model directly
+### Using `llm_payload` — currently sent straight to Rork's AI toolkit
 
 All arithmetic is already done in `llm_payload`; a model only writes prose
-about numbers computed here. **Send `llm_payload` to this backend's own
-`/api/narrative` endpoint** rather than calling an AI provider directly from
-the client:
+about numbers computed here. The shipped client sends it directly to Rork's
+hosted AI toolkit (as originally built) — **do not** switch this to the
+backend's `/api/narrative` endpoint described below; that endpoint exists
+but is not configured server-side (see note above) and would just return
+`501` for every call.
+
+**Not used today, kept for reference if this is revisited later:** if
+`/api/narrative` is ever wired up server-side, the call would look like
+this —
 
 ```js
 const brief = await fetch(`${BASE}/api/brief?flight=${flight}`).then(r => r.json());
@@ -631,18 +642,21 @@ const { narrative } = await fetch(`${BASE}/api/narrative`, {
 "cached": bool}` on success. `cached: true` means an identical
 (system, user, facts) tuple was answered recently and no new model call was
 made — expect this often when several clients poll the same tracked flight
-within a few minutes of each other.
+within a few minutes of each other. Again: not currently reachable, since
+the server-side credential isn't configured (see above).
 
-**Why not call the AI provider straight from the app:** the previous
-approach embedded a provider secret key in the compiled app bundle and sent
-it from the device on every call. That key is recoverable by decompiling the
-IPA or watching the device's own traffic — completely independent of
-anything the backend's own auth does. `/api/narrative` keeps that credential
-server-side only; the client never sees it. If `RORK_TOOLKIT_URL` /
-`RORK_TOOLKIT_SECRET_KEY` aren't configured on the server, the endpoint
-returns `501` — treat that the same as any other narrative failure and fall
-back to the deterministic verdict with no AI text (see `NarrativeError` in
-the client for the existing pattern).
+**Background:** `/api/narrative` was built to close a credential-leak
+concern — the app's current approach embeds Rork's toolkit secret key in
+the compiled bundle, recoverable by decompiling the IPA or watching the
+device's own traffic. Moving the call server-side would keep that secret
+off the device entirely. In practice, though, Rork's toolkit credential is
+platform-managed and isn't exposed for copying out of Rork's project
+settings on our plan, so there's currently no value to put in
+`RORK_TOOLKIT_URL`/`RORK_TOOLKIT_SECRET_KEY` on the server. We're accepting
+that exposure for now and continuing to call Rork's toolkit directly from
+the device, as Rork's hosted-AI feature is designed to be used. If we later
+swap to a standalone AI provider key (not tied to Rork's per-app metering),
+revisit wiring the client to `/api/narrative` at that point.
 
 `system` embeds the full analytical framework plus five guardrails — chiefly
 "every number must come from the facts provided" and "sources marked
