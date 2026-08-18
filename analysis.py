@@ -1150,6 +1150,46 @@ def tracking_interval_minutes(horizon: dict = None, phase: dict = None) -> int:
                min(_TRACKER_INTERVAL_MAX_MINUTES, minutes))
 
 
+# ---------------------------------------------------------------------------
+# Delay trend across scheduled checks
+# ---------------------------------------------------------------------------
+
+# Movement smaller than this across the window is treated as noise —
+# AeroAPI estimates wobble by a couple of minutes between polls without the
+# operational picture changing at all.
+DELAY_TREND_STEADY_BAND_MIN = 3.0
+
+# One check is a data point, not a trend. Anything below this returns None
+# so the client shows nothing rather than a false "holding steady".
+DELAY_TREND_MIN_POINTS = 2
+
+
+def classify_delay_trend(snapshots: list) -> str | None:
+    """'widening' / 'narrowing' / 'steady' across recent checks, or None.
+
+    Deliberately simple: compares the newest delta against the oldest in the
+    window the caller passes (snapshots are stored oldest-first). This makes
+    the trend that is already implicitly happening across checks visible —
+    it is NOT a forecast model and must not be presented as one.
+
+    None when fewer than DELAY_TREND_MIN_POINTS usable deltas exist.
+    """
+    deltas = [
+        s.get("delta_minutes") for s in (snapshots or [])
+        if isinstance(s, dict)
+        and isinstance(s.get("delta_minutes"), (int, float))
+        and not isinstance(s.get("delta_minutes"), bool)
+    ]
+    if len(deltas) < DELAY_TREND_MIN_POINTS:
+        return None
+    diff = deltas[-1] - deltas[0]
+    if diff >= DELAY_TREND_STEADY_BAND_MIN:
+        return "widening"
+    if diff <= -DELAY_TREND_STEADY_BAND_MIN:
+        return "narrowing"
+    return "steady"
+
+
 def describe_position(track_payload, phase: dict = None) -> dict:
     """Turn a raw ADS-B/AeroAPI position into what the aircraft is doing.
 

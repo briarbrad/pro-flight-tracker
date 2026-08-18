@@ -1671,6 +1671,7 @@ def flight_live():
         "predicted_times": predictions,
         "timezones": {"origin": origin_tz, "destination": dest_tz},
         "edct_cache": edct_cache_info,
+        "delay_trend": _delay_trend_payload(flight, date),
         "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
         "aeroapi_queries_used": 1,
     }), 200
@@ -1981,6 +1982,7 @@ def flight_brief():
         "sources_excluded": excluded,
         "sources": sources,
         "llm_payload": payload,
+        "delay_trend": _delay_trend_payload(flight, date),
         "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
         "aeroapi_queries_used": aeroapi_queries,
     }), 200
@@ -2194,6 +2196,69 @@ def _departure_delay_minutes(flight: dict):
     if not effective:
         return None
     return (effective - scheduled).total_seconds() / 60.0
+
+
+def _arrival_delay_minutes(flight: dict):
+    """Minutes the gate arrival has slipped vs schedule, or None if unknowable."""
+    scheduled = _parse_iso(flight.get("scheduled_in"))
+    if not scheduled:
+        return None
+    actual = _parse_iso(flight.get("actual_in"))
+    estimated = _parse_iso(flight.get("estimated_in"))
+    effective = actual or estimated
+    if not effective:
+        return None
+    return (effective - scheduled).total_seconds() / 60.0
+
+
+def _snapshot_fields(flight: dict):
+    """(predicted_out, predicted_in, delta_minutes) for a delay-trend snapshot.
+
+    Everything comes from the status payload the tracker already fetched —
+    recording a snapshot costs zero additional AeroAPI queries. delta_minutes
+    tracks the next gate event that can still move: the departure slip until
+    the aircraft is out, then the arrival slip.
+    """
+    if not isinstance(flight, dict):
+        return None, None, None
+    predicted_out = (flight.get("actual_out") or flight.get("estimated_out")
+                     or flight.get("scheduled_out"))
+    predicted_in = (flight.get("actual_in") or flight.get("estimated_in")
+                    or flight.get("scheduled_in"))
+    if flight.get("actual_out"):
+        delta = _arrival_delay_minutes(flight)
+        if delta is None:
+            delta = _departure_delay_minutes(flight)
+    else:
+        delta = _departure_delay_minutes(flight)
+    return (predicted_out, predicted_in,
+            round(delta, 1) if delta is not None else None)
+
+
+def _delay_trend_payload(flight: str, date: str) -> dict | None:
+    """delay_trend block for the brief/live envelopes, or None.
+
+    Reads the snapshots the background tracker has been writing on its
+    normal cadence. None (→ JSON null) when nothing usable exists yet — a
+    single check is a data point, not a trend, and the client must show
+    nothing rather than a false "holding steady".
+    """
+    try:
+        snaps = store.recent_snapshots(f"{flight}_{date}")
+    except Exception:
+        return None
+    usable = [s for s in snaps if s.get("delta_minutes") is not None]
+    if not usable:
+        return None
+    return {
+        "snapshots": [{
+            "checked_at": s.get("checked_at"),
+            "delta_minutes": s.get("delta_minutes"),
+            "risk": s.get("risk"),
+        } for s in usable],
+        "direction": analysis.classify_delay_trend(usable),
+        "checks": len(usable),
+    }
 
 
 def _faa_airport_records(faa_status: dict) -> list:
@@ -2419,6 +2484,18 @@ def background_tracker():
                     horizon, tracked_phase)
                 store.mark_checked(track_id, now, new_risk,
                                     interval_minutes=next_interval)
+
+                # Durable delay history: one snapshot per scheduled check,
+                # from data already in hand (no extra AeroAPI spend). This
+                # is what /api/brief and /api/flight/live read back as
+                # delay_trend — without it, whether a delay is growing or
+                # shrinking is discarded on every poll.
+                snap_out, snap_in, snap_delta = _snapshot_fields(primary)
+                store.record_snapshot(track_id, now,
+                                      predicted_out=snap_out,
+                                      predicted_in=snap_in,
+                                      delta_minutes=snap_delta,
+                                      risk=new_risk)
 
                 # Stop tracking once the flight is over.
                 finished = _flight_is_finished(

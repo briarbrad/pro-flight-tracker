@@ -223,6 +223,20 @@ CREATE TABLE IF NOT EXISTS swim_daemon_status (
 );
 """
 
+SNAPSHOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS flight_snapshots (
+    id            BIGSERIAL PRIMARY KEY,
+    track_id      TEXT NOT NULL,
+    checked_at    TIMESTAMPTZ NOT NULL,
+    predicted_out TEXT,
+    predicted_in  TEXT,
+    delta_minutes DOUBLE PRECISION,
+    risk          TEXT
+);
+CREATE INDEX IF NOT EXISTS flight_snapshots_track_time
+    ON flight_snapshots (track_id, checked_at DESC);
+"""
+
 _COLS = ("track_id, flight, flight_date, push_token, interval_minutes, "
          "last_check, last_risk, created_at, expires_at")
 
@@ -252,6 +266,7 @@ def init() -> None:
                 cur.execute(SCHEMA)
                 cur.execute(EDCT_SCHEMA)
                 cur.execute(SWIM_SCHEMA)
+                cur.execute(SNAPSHOT_SCHEMA)
             conn.commit()
     except Exception as exc:
         if "pg_type_typname_nsp_index" in str(exc):
@@ -418,8 +433,13 @@ def mark_checked(track_id: str, when: datetime, risk: str,
 
 
 def purge_expired(now: datetime = None) -> int:
-    """Drop flights past their TTL. Returns how many were removed."""
+    """Drop flights past their TTL. Returns how many were removed.
+
+    Also prunes delay-trend snapshots past the same tracking window, so the
+    history table can never outgrow the set of flights anyone is tracking.
+    """
     now = now or _now()
+    snapshot_cutoff = now - timedelta(hours=SNAPSHOT_RETENTION_HOURS)
 
     if using_postgres():
         with _connect() as conn:
@@ -428,6 +448,11 @@ def purge_expired(now: datetime = None) -> int:
                             "WHERE expires_at IS NOT NULL AND expires_at <= %s",
                             (now,))
                 deleted = cur.rowcount
+                try:
+                    cur.execute("DELETE FROM flight_snapshots "
+                                "WHERE checked_at <= %s", (snapshot_cutoff,))
+                except Exception:
+                    pass  # table may not exist yet on a fresh database
             conn.commit()
         return deleted
 
@@ -436,7 +461,113 @@ def purge_expired(now: datetime = None) -> int:
                  if (_parse(r.get("expires_at")) or now + timedelta(days=1)) <= now]
         for tid in stale:
             del _mem[tid]
+        for tid in list(_snap_mem):
+            rows = [r for r in _snap_mem[tid]
+                    if (_parse(r.get("checked_at")) or now) > snapshot_cutoff]
+            if rows:
+                _snap_mem[tid] = rows
+            else:
+                del _snap_mem[tid]
         return len(stale)
+
+
+# ---------------------------------------------------------------------------
+# Delay-trend snapshots
+#
+# One row per scheduled tracker check: the predicted out/in times and the
+# delay-vs-schedule delta at that moment. tracked_flights only ever kept the
+# LAST risk tier, so "is this delay growing, shrinking, or holding steady"
+# was silently discarded on every poll. This table makes that trend durable.
+# Written on the tracker's existing cadence — recording it costs zero extra
+# AeroAPI queries. Pruned to the flight's own tracking window (TTL), so it
+# is a rolling history, not an archive.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_RETENTION_HOURS = DEFAULT_TTL_HOURS
+
+_snap_mem: dict[str, list] = {}
+
+
+def record_snapshot(track_id: str, checked_at: datetime,
+                    predicted_out: str = None, predicted_in: str = None,
+                    delta_minutes: float = None, risk: str = None) -> None:
+    """Append one check's outcome to the flight's delay history.
+
+    Best-effort: a failure here must never break the tracker loop. Prunes
+    this track's rows past the retention window on every write, so growth
+    is bounded even if purge_expired never runs.
+    """
+    if not track_id:
+        return
+    checked_at = checked_at or _now()
+    cutoff = checked_at - timedelta(hours=SNAPSHOT_RETENTION_HOURS)
+    if using_postgres():
+        try:
+            with _connect(connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(SNAPSHOT_SCHEMA)  # lazy-create: non-leader workers
+                    cur.execute(
+                        "INSERT INTO flight_snapshots "
+                        "(track_id, checked_at, predicted_out, predicted_in, "
+                        " delta_minutes, risk) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (track_id, checked_at, predicted_out, predicted_in,
+                         delta_minutes, risk))
+                    cur.execute(
+                        "DELETE FROM flight_snapshots "
+                        "WHERE track_id = %s AND checked_at < %s",
+                        (track_id, cutoff))
+                conn.commit()
+            return
+        except Exception:
+            pass  # fall through to memory so at least this worker remembers
+    with _mem_lock:
+        rows = _snap_mem.setdefault(track_id, [])
+        rows.append({
+            "track_id": track_id,
+            "checked_at": _iso(checked_at),
+            "predicted_out": predicted_out,
+            "predicted_in": predicted_in,
+            "delta_minutes": delta_minutes,
+            "risk": risk,
+        })
+        _snap_mem[track_id] = [
+            r for r in rows
+            if (_parse(r.get("checked_at")) or checked_at) >= cutoff
+        ][-500:]
+
+
+def recent_snapshots(track_id: str, limit: int = 12) -> list[dict]:
+    """The last `limit` snapshots for a track, oldest first.
+
+    Oldest-first so callers (and the client) read the series left-to-right
+    as it happened: +2 → +4 → +6. Returns [] on any failure — trend data
+    is an enhancement, never worth failing a response over.
+    """
+    if not track_id:
+        return []
+    if using_postgres():
+        try:
+            with _connect(connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT track_id, checked_at, predicted_out, "
+                        "predicted_in, delta_minutes, risk "
+                        "FROM flight_snapshots WHERE track_id = %s "
+                        "ORDER BY checked_at DESC LIMIT %s",
+                        (track_id, limit))
+                    rows = cur.fetchall()
+            return [{
+                "track_id": r[0],
+                "checked_at": _iso(r[1]),
+                "predicted_out": r[2],
+                "predicted_in": r[3],
+                "delta_minutes": r[4],
+                "risk": r[5],
+            } for r in reversed(rows)]
+        except Exception:
+            return []
+    with _mem_lock:
+        return [dict(r) for r in _snap_mem.get(track_id, [])[-limit:]]
 
 
 # ---------------------------------------------------------------------------
