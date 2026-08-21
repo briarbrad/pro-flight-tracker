@@ -176,12 +176,19 @@ def test_message_history_is_truncated_to_max_messages():
     assert sent_messages[-1]["content"] == messages[-1]["content"]
 
 
-def test_oversized_facts_returns_400():
+def test_large_facts_are_not_rejected():
+    # Real /api/brief facts embed full raw source payloads (METAR, TAF, FAA
+    # status, SWIM feeds) and routinely run past what used to be an
+    # over-conservative size cap here -- that cap broke every real chat
+    # message, so facts size must never gate this endpoint (narrative has
+    # never capped it either).
     client = _client()
-    body = _base_body(facts={"padding": "x" * (app_module.CHAT_MAX_FACTS_CHARS + 100)})
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "secret"}):
+    body = _base_body(facts={"padding": "x" * 200_000})
+    fake_resp = _ok_resp("ok")
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "secret"}), \
+         patch.object(app_module.requests, "post", return_value=fake_resp):
         resp = client.post("/api/chat", json=body)
-    assert resp.status_code == 400
+    assert resp.status_code == 200
 
 
 if __name__ == "__main__":

@@ -2088,7 +2088,6 @@ CHAT_MAX_TOKENS = 700
 CHAT_REASONING_MAX_TOKENS = 250
 CHAT_MAX_MESSAGES = 20  # ~10 back-and-forth turns kept; client trims further back
 CHAT_MAX_MESSAGE_CHARS = 4000
-CHAT_MAX_FACTS_CHARS = 20000
 
 _narrative_cache: dict[str, dict] = {}
 _narrative_cache_lock = threading.Lock()
@@ -2297,10 +2296,6 @@ def api_chat():
         return jsonify({"error": "'facts' is required"}), 400
     if not isinstance(raw_messages, list) or not raw_messages:
         return jsonify({"error": "'messages' must be a non-empty list"}), 400
-
-    facts_chars = len(json.dumps(facts, sort_keys=True, default=str))
-    if facts_chars > CHAT_MAX_FACTS_CHARS:
-        return jsonify({"error": "'facts' is too large"}), 400
 
     cleaned = []
     for m in raw_messages:

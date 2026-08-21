@@ -267,11 +267,14 @@ fallback-model retry.
 Server-side bounds worth knowing (in `app.py`, constants prefixed `CHAT_`):
 only the most recent `CHAT_MAX_MESSAGES` (20) messages are actually sent
 upstream even if the client keeps a longer local history; each message is
-truncated to `CHAT_MAX_MESSAGE_CHARS` (4000) chars server-side; `facts`
-larger than `CHAT_MAX_FACTS_CHARS` (20000) chars is rejected with `400`.
-These exist because chat can rack up far more free-tier calls per flight
-than one narrative ever would, against the same shared 50–1000/day
-`openrouter/free` quota — see §5.
+truncated to `CHAT_MAX_MESSAGE_CHARS` (4000) chars server-side. `facts` is
+NOT size-limited — it embeds the same raw source payloads (METAR, TAF, FAA
+status, SWIM feeds) as `/api/narrative` already sends uncapped, and those
+routinely exceed tens of KB for a real flight, so imposing a cap here would
+just reject legitimate questions (this shipped once and broke chat entirely
+until it was removed). The per-conversation message caps exist because chat
+can rack up far more free-tier calls per flight than one narrative ever
+would, against the same shared 50–1000/day `openrouter/free` quota — see §5.
 
 ---
 
