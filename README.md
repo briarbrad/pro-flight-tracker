@@ -138,9 +138,8 @@ pro-flight-tracker/
 | `DISABLE_TRACKER` | optional | Set `1` to stop background polling without a code deploy |
 | `DB_POOL_MAX_SIZE` | optional | Max pooled Postgres connections (default `10`) |
 | `ALLOWED_ORIGINS` | optional | Comma-separated browser origins allowed to call the API cross-origin. Empty (default) allows none. Purely a browser-side CORS control — it has no effect on the native iOS client, which never sends an `Origin` header |
-| `RORK_TOOLKIT_URL` | required for `/api/narrative` | Base URL of Rork's AI toolkit. **Not currently set** — Rork's Secrets panel doesn't expose this as a copyable value on our plan; it's an internal, platform-managed credential tied to Rork's own hosted-AI billing, not something meant to be extracted. See note below |
-| `RORK_TOOLKIT_SECRET_KEY` | required for `/api/narrative` | Server-side secret for the toolkit call. Same story as `RORK_TOOLKIT_URL` above — unset, so `/api/narrative` returns `501`. This is fine: the app doesn't call this endpoint |
-| `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling the toolkit again (default `180`, `0` disables caching) |
+| `OPENROUTER_API_KEY` | required for `/api/narrative` | Server-side secret for the narrative call. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and set it here — never in the iOS app bundle. Without it, `/api/narrative` returns `501` and the client falls back to rendering the deterministic verdict with no prose narrative |
+| `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling OpenRouter again (default `180`, `0` disables caching) |
 | `API_TOKEN` / `REQUIRE_AUTH` | optional | Bearer-token auth, dormant until `REQUIRE_AUTH=1` is set (see `app.py`'s auth section for the rollout sequence). `API.swift` already sends `Config.EXPO_PUBLIC_BACKEND_API_TOKEN` as a bearer token when configured, so enabling this needs no new iOS code — only matching values on both sides |
 
 SWIM usernames, queue names, and broker assignments live in `swim/config.json`,

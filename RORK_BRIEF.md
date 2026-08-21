@@ -225,12 +225,12 @@ See §6.
 | `/api/narrative` | `POST` | JSON body: `system`, `user`, `facts` — pass `llm_payload` from `/api/brief` straight through |
 
 See §4b “Using `llm_payload`” for the full contract. **Note:** this endpoint
-is currently dormant — `RORK_TOOLKIT_URL`/`RORK_TOOLKIT_SECRET_KEY` aren't
-set on the server (Rork's toolkit credential isn't exposed for copying out
-of Rork's Secrets UI on our plan), so it always returns `501` today. The
-shipped app keeps calling Rork's hosted AI toolkit directly, as originally
-built — do not point `NarrativeService.swift` at this endpoint unless the
-server side gets configured with a real provider key first.
+is now live — the server holds a standalone `OPENROUTER_API_KEY` and calls
+OpenRouter's Free Models Router (`openrouter/free`, $0/token) on the
+client's behalf. `NarrativeService.swift` should call this endpoint instead
+of any AI provider directly: send it the same `{system, user, facts}` shape
+`/api/brief`'s `llm_payload` already gives you, unmodified. No provider
+secret should ever ship inside the compiled app again.
 
 ---
 
@@ -642,21 +642,22 @@ const { narrative } = await fetch(`${BASE}/api/narrative`, {
 "cached": bool}` on success. `cached: true` means an identical
 (system, user, facts) tuple was answered recently and no new model call was
 made — expect this often when several clients poll the same tracked flight
-within a few minutes of each other. Again: not currently reachable, since
-the server-side credential isn't configured (see above).
+within a few minutes of each other.
 
 **Background:** `/api/narrative` was built to close a credential-leak
-concern — the app's current approach embeds Rork's toolkit secret key in
+concern — the app's original approach embedded Rork's toolkit secret key in
 the compiled bundle, recoverable by decompiling the IPA or watching the
-device's own traffic. Moving the call server-side would keep that secret
-off the device entirely. In practice, though, Rork's toolkit credential is
-platform-managed and isn't exposed for copying out of Rork's project
-settings on our plan, so there's currently no value to put in
-`RORK_TOOLKIT_URL`/`RORK_TOOLKIT_SECRET_KEY` on the server. We're accepting
-that exposure for now and continuing to call Rork's toolkit directly from
-the device, as Rork's hosted-AI feature is designed to be used. If we later
-swap to a standalone AI provider key (not tied to Rork's per-app metering),
-revisit wiring the client to `/api/narrative` at that point.
+device's own traffic. That's now fixed: the server holds a standalone
+OpenRouter key (`OPENROUTER_API_KEY`, set on Railway, never in the app),
+calls OpenRouter's Free Models Router (`openrouter/free`) on the client's
+behalf, and returns just the finished narrative text. `NarrativeService.
+swift` should call this endpoint exclusively — no provider secret of any
+kind belongs in the iOS bundle going forward. `openrouter/free` was chosen
+over OpenRouter's task-aware `auto`/`auto-beta` routers specifically
+because it never bills per token (auto/auto-beta pass through the routed
+model's standard rate instead); the tradeoff is a lower quality ceiling and
+a shared daily rate limit (50 req/day, 1000/day once the account has $10+
+in purchased credits) across every caller of this one server-side key.
 
 `system` embeds the full analytical framework plus five guardrails — chiefly
 "every number must come from the facts provided" and "sources marked

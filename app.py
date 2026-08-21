@@ -2031,22 +2031,35 @@ def flight_brief():
 # AI narrative proxy
 #
 # The client used to call Rork's AI toolkit directly from NarrativeService.
-# swift, sending `Bearer {RORK_TOOLKIT_SECRET_KEY}` from the device. That key
-# ships inside the compiled app bundle, so anyone who decompiles the IPA (or
-# just runs a proxy on the device and watches its own traffic) recovers a
-# live credential good against the account's Rork toolkit quota — completely
-# independent of anything this server's own auth/rate-limit gate does. This
-# endpoint moves the call server-side: the secret now lives only in Railway's
-# environment, and the client sends the same llm_payload it already computes
-# — just to this endpoint instead of straight to the toolkit.
+# swift, sending a bearer secret from the device. That key ships inside the
+# compiled app bundle, so anyone who decompiles the IPA (or just runs a proxy
+# on the device and watches its own traffic) recovers a live credential good
+# against the account's AI provider quota — completely independent of
+# anything this server's own auth/rate-limit gate does. This endpoint moves
+# the call server-side: the secret now lives only in Railway's environment,
+# and the client sends the same llm_payload it already computes — just to
+# this endpoint instead of straight to the provider.
+#
+# Upstream is OpenRouter's Free Models Router (`openrouter/free`), which
+# picks a $0/token model at random from OpenRouter's free-tier catalog on
+# every call. That's a deliberate choice over `openrouter/auto`/`auto-beta`
+# (OpenRouter's task-aware router): those bill at whatever underlying model
+# they route to — no extra router fee, but not zero-cost — while
+# `openrouter/free` never leaves the free tier, at the cost of a lower
+# quality ceiling and tighter rate limits (50 req/day, 1000/day once the
+# account has $10+ in purchased credits — shared across every caller of this
+# server-side key, not per end user). Revisit if narratives start getting
+# throttled or the free-tier quality isn't good enough.
 #
 # Response caching is keyed on a hash of the exact (system, user, facts)
 # tuple the client would have sent: two clients polling the same tracked
 # flight seconds apart produce byte-identical facts (same phase, verdict,
-# predicted times) and would otherwise pay for the same completion twice.
+# predicted times) and would otherwise pay for (or burn free-tier quota on)
+# the same completion twice.
 # ---------------------------------------------------------------------------
 
-NARRATIVE_MODEL = "anthropic/claude-haiku-4.5"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+NARRATIVE_MODEL = "openrouter/free"
 NARRATIVE_CACHE_TTL_SECONDS = max(
     0, int(os.environ.get("NARRATIVE_CACHE_TTL_SECONDS", "180") or 180))
 NARRATIVE_CACHE_MAX_ENTRIES = 200
@@ -2092,13 +2105,12 @@ def api_narrative():
     of the `llm_payload` object /api/brief already returns, sent back
     unmodified. Response: {"narrative": str, "cached": bool}.
     """
-    toolkit_url = os.environ.get("RORK_TOOLKIT_URL", "").strip().rstrip("/")
-    toolkit_key = os.environ.get("RORK_TOOLKIT_SECRET_KEY", "").strip()
-    if not toolkit_url or not toolkit_key:
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_key:
         return jsonify({
             "error": "AI narrative is not configured on the server",
-            "hint": "Set RORK_TOOLKIT_URL and RORK_TOOLKIT_SECRET_KEY on Railway "
-                    "(copy the values from Rork's project settings)",
+            "hint": "Set OPENROUTER_API_KEY on Railway (create a key at "
+                    "https://openrouter.ai/settings/keys)",
         }), 501
 
     body = request.get_json(silent=True) or {}
@@ -2119,7 +2131,7 @@ def api_narrative():
 
     try:
         resp = requests.post(
-            f"{toolkit_url}/v2/vercel/v1/chat/completions",
+            OPENROUTER_API_URL,
             json={
                 "model": NARRATIVE_MODEL,
                 "messages": [
@@ -2129,8 +2141,12 @@ def api_narrative():
                 "temperature": 0.3,
                 "max_tokens": 500,
             },
-            headers={"Authorization": f"Bearer {toolkit_key}",
-                     "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {openrouter_key}",
+                     "Content-Type": "application/json",
+                     # Optional per OpenRouter's docs, but they use this to
+                     # attribute traffic on their public rankings page.
+                     "HTTP-Referer": "https://pro-flight-tracker-production.up.railway.app",
+                     "X-Title": "Pro Flight Tracker"},
             timeout=45,
         )
     except requests.RequestException as exc:
@@ -2139,7 +2155,7 @@ def api_narrative():
         }), 502
 
     if resp.status_code != 200:
-        # Pass the toolkit's own status through — the client's NarrativeError
+        # Pass OpenRouter's own status through — the client's NarrativeError
         # already has copy for 401/402/429 and a generic fallback for others.
         return jsonify({
             "error": f"Narrative service error ({resp.status_code})",
