@@ -2060,6 +2060,20 @@ def flight_brief():
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 NARRATIVE_MODEL = "openrouter/free"
+# openrouter/free's random pool includes reasoning models (e.g. DeepSeek R1
+# free) alongside plain instruct models, and OpenRouter's own docs give no
+# guarantee that a reasoning model won't spend its entire max_tokens budget
+# on internal "thinking" tokens before writing anything into `content` --
+# in which case the visible answer comes back empty even though the call
+# itself succeeded (billed $0, shows up in OpenRouter's Activity log). We
+# mitigate two ways: (1) cap reasoning spend via `reasoning.max_tokens` on
+# models that honor it, leaving headroom in the overall budget for the
+# actual answer, and (2) if a call still comes back empty, retry once
+# against a pinned, known non-reasoning free model rather than re-rolling
+# the random router and risking the same outcome again.
+NARRATIVE_MAX_TOKENS = 900
+NARRATIVE_REASONING_MAX_TOKENS = 300
+NARRATIVE_FALLBACK_MODEL = "meta-llama/llama-3.2-3b-instruct:free"
 NARRATIVE_CACHE_TTL_SECONDS = max(
     0, int(os.environ.get("NARRATIVE_CACHE_TTL_SECONDS", "180") or 180))
 NARRATIVE_CACHE_MAX_ENTRIES = 200
@@ -2129,18 +2143,26 @@ def api_narrative():
     if facts is not None:
         user_content += "\n" + json.dumps(facts, sort_keys=True, default=str)
 
-    try:
-        resp = requests.post(
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    def _call_openrouter(model: str, cap_reasoning: bool):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": NARRATIVE_MAX_TOKENS,
+        }
+        if cap_reasoning:
+            # Leaves headroom in max_tokens for the actual answer even if
+            # the router lands on a reasoning model -- harmlessly ignored
+            # by models that don't support it.
+            payload["reasoning"] = {"max_tokens": NARRATIVE_REASONING_MAX_TOKENS}
+        return requests.post(
             OPENROUTER_API_URL,
-            json={
-                "model": NARRATIVE_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 500,
-            },
+            json=payload,
             headers={"Authorization": f"Bearer {openrouter_key}",
                      "Content-Type": "application/json",
                      # Optional per OpenRouter's docs, but they use this to
@@ -2149,6 +2171,17 @@ def api_narrative():
                      "X-Title": "Pro Flight Tracker"},
             timeout=45,
         )
+
+    def _extract_text(resp):
+        """Returns (text, error_response_or_None)."""
+        try:
+            text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        except (ValueError, KeyError, IndexError, TypeError):
+            return None, (jsonify({"error": "Narrative service returned an unexpected shape"}), 502)
+        return text, None
+
+    try:
+        resp = _call_openrouter(NARRATIVE_MODEL, cap_reasoning=True)
     except requests.RequestException as exc:
         return jsonify({
             "error": f"Narrative service unreachable: {type(exc).__name__}",
@@ -2161,10 +2194,28 @@ def api_narrative():
             "error": f"Narrative service error ({resp.status_code})",
         }), resp.status_code
 
-    try:
-        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-    except (ValueError, KeyError, IndexError, TypeError):
-        return jsonify({"error": "Narrative service returned an unexpected shape"}), 502
+    text, err = _extract_text(resp)
+    if err is not None:
+        return err
+
+    if not text:
+        # openrouter/free landed on a reasoning model that used its whole
+        # budget thinking and never wrote a final answer. Retry once
+        # against a pinned non-reasoning free model instead of re-rolling
+        # the same random risk.
+        try:
+            retry_resp = _call_openrouter(NARRATIVE_FALLBACK_MODEL, cap_reasoning=False)
+        except requests.RequestException as exc:
+            return jsonify({
+                "error": f"Narrative service unreachable: {type(exc).__name__}",
+            }), 502
+        if retry_resp.status_code != 200:
+            return jsonify({
+                "error": f"Narrative service error ({retry_resp.status_code})",
+            }), retry_resp.status_code
+        text, err = _extract_text(retry_resp)
+        if err is not None:
+            return err
 
     if not text:
         return jsonify({"error": "The narrative came back empty"}), 502

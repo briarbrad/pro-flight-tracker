@@ -659,6 +659,18 @@ model's standard rate instead); the tradeoff is a lower quality ceiling and
 a shared daily rate limit (50 req/day, 1000/day once the account has $10+
 in purchased credits) across every caller of this one server-side key.
 
+**Known failure mode:** `openrouter/free`'s random pool includes reasoning
+models (e.g. DeepSeek R1 free). A reasoning model can spend its entire
+`max_tokens` budget on internal "thinking" tokens and never write anything
+to the visible `content` field — the call still succeeds and shows up in
+OpenRouter's Activity log, but the endpoint has nothing to return. We cap
+reasoning spend via `reasoning.max_tokens` on the first attempt, and if
+`content` still comes back empty, retry once against a pinned non-reasoning
+free model (`NARRATIVE_FALLBACK_MODEL` in `app.py`) instead of re-rolling
+the same random risk. Worst case this costs 2 free-tier requests per
+narrative instead of 1, so budget for that against the 50-1000/day shared
+quota above.
+
 `system` embeds the full analytical framework plus five guardrails — chiefly
 "every number must come from the facts provided" and "sources marked
 not_consulted were deliberately excluded; do not speculate about them."

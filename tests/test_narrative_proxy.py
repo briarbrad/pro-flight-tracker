@@ -113,6 +113,56 @@ def test_openrouter_error_status_passes_through():
     assert resp.status_code == 429
 
 
+def test_empty_content_from_free_router_retries_pinned_fallback_model():
+    """openrouter/free can land on a reasoning model (e.g. DeepSeek R1 free)
+    that spends its whole token budget thinking and writes nothing to
+    `content`. The endpoint should retry once against
+    NARRATIVE_FALLBACK_MODEL rather than surfacing the empty result."""
+    _clear_narrative_cache()
+    client = _client()
+    empty_resp = MagicMock()
+    empty_resp.status_code = 200
+    empty_resp.json.return_value = {
+        "choices": [{"message": {"content": None,
+                                  "reasoning": "...spent the whole budget thinking..."}}]
+    }
+    good_resp = MagicMock()
+    good_resp.status_code = 200
+    good_resp.json.return_value = {
+        "choices": [{"message": {"content": "Flight is on time."}}]
+    }
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "secret"}), \
+         patch.object(app_module.requests, "post",
+                     side_effect=[empty_resp, good_resp]) as mock_post:
+        resp = client.post("/api/narrative",
+                           json={"system": "s", "user": "u", "facts": {"a": 1}})
+    assert resp.status_code == 200
+    assert resp.get_json()["narrative"] == "Flight is on time."
+    assert mock_post.call_count == 2
+    first_call, second_call = mock_post.call_args_list
+    assert first_call.kwargs["json"]["model"] == "openrouter/free"
+    assert "reasoning" in first_call.kwargs["json"]
+    assert second_call.kwargs["json"]["model"] == app_module.NARRATIVE_FALLBACK_MODEL
+    assert "reasoning" not in second_call.kwargs["json"]
+
+
+def test_empty_content_from_both_attempts_returns_502():
+    _clear_narrative_cache()
+    client = _client()
+    empty_resp = MagicMock()
+    empty_resp.status_code = 200
+    empty_resp.json.return_value = {
+        "choices": [{"message": {"content": ""}}]
+    }
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "secret"}), \
+         patch.object(app_module.requests, "post", return_value=empty_resp) as mock_post:
+        resp = client.post("/api/narrative",
+                           json={"system": "s", "user": "u", "facts": {"a": 1}})
+    assert resp.status_code == 502
+    assert "empty" in resp.get_json()["error"]
+    assert mock_post.call_count == 2
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
