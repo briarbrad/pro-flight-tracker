@@ -61,7 +61,8 @@ Full reference with response shapes lives in [RORK_BRIEF.md](RORK_BRIEF.md).
 | FAA SWIM | `/api/swim/{tbfm,sfdps,itws,notams,stdds,tfms-flight,tfms-flow,tfdm}` | free | duration + ~4s |
 | Aggregate | `/api/check` | **AeroAPI** | 30–60s |
 | Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with phase + horizon |
-| Narrative | `/api/narrative` | Rork AI toolkit (server-side) — **currently unused, see note below** | 1–5s, cached briefly |
+| Narrative | `/api/narrative` | OpenRouter Free Models Router (server-side) | 1–5s, cached briefly |
+| Chat | `/api/chat` | OpenRouter Free Models Router (server-side) | 1–5s, never cached |
 | Tracking | `/api/track` (POST/DELETE), `/api/tracked` | **AeroAPI** per interval, cadence adapts to phase | instant |
 
 Only the AeroAPI-backed endpoints cost money. Weather, airport ops, and all
@@ -138,8 +139,8 @@ pro-flight-tracker/
 | `DISABLE_TRACKER` | optional | Set `1` to stop background polling without a code deploy |
 | `DB_POOL_MAX_SIZE` | optional | Max pooled Postgres connections (default `10`) |
 | `ALLOWED_ORIGINS` | optional | Comma-separated browser origins allowed to call the API cross-origin. Empty (default) allows none. Purely a browser-side CORS control — it has no effect on the native iOS client, which never sends an `Origin` header |
-| `OPENROUTER_API_KEY` | required for `/api/narrative` | Server-side secret for the narrative call. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and set it here — never in the iOS app bundle. Without it, `/api/narrative` returns `501` and the client falls back to rendering the deterministic verdict with no prose narrative |
-| `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling OpenRouter again (default `180`, `0` disables caching) |
+| `OPENROUTER_API_KEY` | required for `/api/narrative` and `/api/chat` | Server-side secret shared by both AI features. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and set it here — never in the iOS app bundle. Without it, both endpoints return `501`; `/api/narrative`'s client falls back to the deterministic verdict with no prose narrative, and the chat button should hide/disable itself client-side (see `RORK_BRIEF.md`) |
+| `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling OpenRouter again (default `180`, `0` disables caching). `/api/chat` is never cached — every question is different |
 | `API_TOKEN` / `REQUIRE_AUTH` | optional | Bearer-token auth, dormant until `REQUIRE_AUTH=1` is set (see `app.py`'s auth section for the rollout sequence). `API.swift` already sends `Config.EXPO_PUBLIC_BACKEND_API_TOKEN` as a bearer token when configured, so enabling this needs no new iOS code — only matching values on both sides |
 
 SWIM usernames, queue names, and broker assignments live in `swim/config.json`,

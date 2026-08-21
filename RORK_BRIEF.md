@@ -232,6 +232,47 @@ of any AI provider directly: send it the same `{system, user, facts}` shape
 `/api/brief`'s `llm_payload` already gives you, unmodified. No provider
 secret should ever ship inside the compiled app again.
 
+### Chat
+
+| Endpoint | Method | Params |
+|---|---|---|
+| `/api/chat` | `POST` | JSON body: `flight` (str), `date` (str), `facts` (the same `llm_payload.facts` object `/api/brief` already gives you), `messages` (array of `{role: "user"\|"assistant", content: str}`, ending on a `user` message) |
+
+Interactive counterpart to Narrative — lets the traveller ask free-form
+follow-up questions about one flight ("why is there a weather delay when
+the skies are clear", "what if the inbound flight is delayed further",
+"do you think the delay increases") instead of only reading one
+self-contained synthesis. Same upstream (`openrouter/free`, server-side
+`OPENROUTER_API_KEY`, same empty-content-from-a-reasoning-model retry
+mitigation as Narrative), same "no provider secret in the app bundle" rule.
+
+The endpoint is **stateless** — it holds no conversation memory between
+requests. The client owns the conversation: keep the running `messages`
+array in memory for that chat session (SwiftUI `@State`/`@Observable` is
+enough, no persistence needed — the thread doesn't need to survive an app
+restart) and resend the whole array, appending the new user question, on
+every turn. `facts` should be `/api/brief`'s `llm_payload.facts` for that
+flight, sent unmodified every time — the server rebuilds the system prompt
+fresh each request so it's always current if the flight's facts changed
+since the chat opened.
+
+Response: `{"reply": str}`. Errors follow the same shape as Narrative: `501`
+if `OPENROUTER_API_KEY` isn't set, `400` for a malformed body (missing
+`flight`/`date`/`facts`, empty/missing `messages`, a message with a bad
+`role` or empty `content`, or a `messages` array not ending on `user`), and
+otherwise OpenRouter's own status code passed through (`429` = rate
+limited, etc.) or `502` if the narrative still comes back empty after the
+fallback-model retry.
+
+Server-side bounds worth knowing (in `app.py`, constants prefixed `CHAT_`):
+only the most recent `CHAT_MAX_MESSAGES` (20) messages are actually sent
+upstream even if the client keeps a longer local history; each message is
+truncated to `CHAT_MAX_MESSAGE_CHARS` (4000) chars server-side; `facts`
+larger than `CHAT_MAX_FACTS_CHARS` (20000) chars is rejected with `400`.
+These exist because chat can rack up far more free-tier calls per flight
+than one narrative ever would, against the same shared 50–1000/day
+`openrouter/free` quota — see §5.
+
 ---
 
 ## 4. `/api/check` — the aggregate endpoint

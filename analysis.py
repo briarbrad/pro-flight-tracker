@@ -21,6 +21,7 @@ reproduces that mistake, so horizon gating happens before the model is asked
 anything.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -813,6 +814,53 @@ def build_llm_payload(flight_ident: str, date: str, horizon: dict,
         "note": "Send `system` as the system prompt and `user` + "
                 "JSON.stringify(facts) as the user message.",
     }
+
+
+CHAT_EXTRA_RULES = [
+    "You may reason qualitatively about hypotheticals the traveller raises "
+    "(e.g. 'what if the inbound aircraft is delayed further') by describing "
+    "the mechanism and its likely direction, but you must say plainly when "
+    "you are speculating beyond the given facts, and you must never invent a "
+    "new number (minutes, probability, clock time) to make the speculation "
+    "sound precise.",
+    "If asked whether risk is likely to increase or decrease, answer in "
+    "terms of the mechanism and what signal would confirm it, not a bare "
+    "percentage — there is no probability model behind these facts.",
+    "If the traveller asks something with no connection to this flight's "
+    "status, timing, or delay risk, say briefly that you're scoped to this "
+    "flight and redirect back to it rather than answering off-topic.",
+    "Keep answers conversational and short — a few sentences, not a report. "
+    "This is a chat reply, not the full narrative already shown elsewhere "
+    "in the app.",
+]
+
+
+def build_chat_system_prompt(flight_ident: str, date: str, facts: dict) -> str:
+    """System prompt for the interactive flight-chat feature.
+
+    Reuses the same guardrails and methodology reference as
+    `build_llm_payload` (no fabricated numbers, respect stated confidence,
+    local time only, etc.) but frames the job as answering a traveller's
+    follow-up questions in a running conversation rather than writing one
+    self-contained narrative. The facts are embedded directly in the system
+    message — every turn in the conversation shares this same grounding
+    without the client needing to resend it as a user message.
+    """
+    facts_json = json.dumps(facts, sort_keys=True, default=str)
+    return (
+        f"You are a flight delay risk analyst chatting with a traveller "
+        f"about flight {flight_ident} on {date}. You are given facts that "
+        "have already been gathered, filtered by relevance, and analysed "
+        "deterministically. Your job is synthesis and explanation only — "
+        "answer their questions about this flight using the facts below.\n\n"
+        "Rules:\n"
+        + "\n".join(f"- {r}" for r in SYNTHESIS_RULES)
+        + "\n" + "\n".join(f"- {r}" for r in CHAT_EXTRA_RULES)
+        + "\n\nMethodology reference:\n\n"
+        + _framework_text()
+        + "\n\nFACTS:\n"
+        + facts_json
+    )
 
 
 # ---------------------------------------------------------------------------

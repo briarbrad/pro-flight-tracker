@@ -2078,6 +2078,18 @@ NARRATIVE_CACHE_TTL_SECONDS = max(
     0, int(os.environ.get("NARRATIVE_CACHE_TTL_SECONDS", "180") or 180))
 NARRATIVE_CACHE_MAX_ENTRIES = 200
 
+# /api/chat -- interactive follow-up Q&A about one flight, grounded in the
+# same `facts` the narrative feature uses. Shares NARRATIVE_MODEL /
+# NARRATIVE_FALLBACK_MODEL and the same empty-content retry mitigation, but
+# is never cached (every question is different) and is bounded harder since
+# a chat can rack up many more calls per flight than one narrative ever
+# would against the shared 50-1000/day openrouter/free quota.
+CHAT_MAX_TOKENS = 700
+CHAT_REASONING_MAX_TOKENS = 250
+CHAT_MAX_MESSAGES = 20  # ~10 back-and-forth turns kept; client trims further back
+CHAT_MAX_MESSAGE_CHARS = 4000
+CHAT_MAX_FACTS_CHARS = 20000
+
 _narrative_cache: dict[str, dict] = {}
 _narrative_cache_lock = threading.Lock()
 
@@ -2109,6 +2121,98 @@ def _narrative_cache_put(key: str, text: str) -> None:
             oldest = min(_narrative_cache,
                         key=lambda k: _narrative_cache[k]["stored_at"])
             del _narrative_cache[oldest]
+
+
+def _openrouter_call(openrouter_key: str, messages: list, model: str,
+                     cap_reasoning: bool, max_tokens: int,
+                     reasoning_max_tokens: int = NARRATIVE_REASONING_MAX_TOKENS):
+    """POST one chat-completion request to OpenRouter.
+
+    Shared by /api/narrative and /api/chat so both get the same headers,
+    timeout, and reasoning-token-budget mitigation (see NARRATIVE_MODEL
+    comment above for why that mitigation exists).
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+    if cap_reasoning:
+        payload["reasoning"] = {"max_tokens": reasoning_max_tokens}
+    return requests.post(
+        OPENROUTER_API_URL,
+        json=payload,
+        headers={"Authorization": f"Bearer {openrouter_key}",
+                 "Content-Type": "application/json",
+                 # Optional per OpenRouter's docs, but they use this to
+                 # attribute traffic on their public rankings page.
+                 "HTTP-Referer": "https://pro-flight-tracker-production.up.railway.app",
+                 "X-Title": "Pro Flight Tracker"},
+        timeout=45,
+    )
+
+
+def _openrouter_extract_text(resp):
+    """Returns (text, error_response_or_None) from a successful (200) resp."""
+    try:
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None, (jsonify({"error": "Narrative service returned an unexpected shape"}), 502)
+    return text, None
+
+
+def _openrouter_call_with_fallback(openrouter_key: str, messages: list,
+                                   max_tokens: int,
+                                   reasoning_max_tokens: int = NARRATIVE_REASONING_MAX_TOKENS):
+    """Calls openrouter/free (reasoning-capped), and if `content` still comes
+    back empty -- e.g. the router landed on a reasoning model that spent its
+    whole budget thinking -- retries once against a pinned non-reasoning
+    free model. Returns (text_or_None, error_response_or_None) where the
+    error is already a (jsonify(...), status) tuple ready to `return`.
+    """
+    try:
+        resp = _openrouter_call(openrouter_key, messages, NARRATIVE_MODEL,
+                                cap_reasoning=True, max_tokens=max_tokens,
+                                reasoning_max_tokens=reasoning_max_tokens)
+    except requests.RequestException as exc:
+        return None, (jsonify({
+            "error": f"Narrative service unreachable: {type(exc).__name__}",
+        }), 502)
+
+    if resp.status_code != 200:
+        # Pass OpenRouter's own status through — the client's error handling
+        # already has copy for 401/402/429 and a generic fallback for others.
+        return None, (jsonify({
+            "error": f"Narrative service error ({resp.status_code})",
+        }), resp.status_code)
+
+    text, err = _openrouter_extract_text(resp)
+    if err is not None:
+        return None, err
+
+    if not text:
+        try:
+            retry_resp = _openrouter_call(openrouter_key, messages,
+                                          NARRATIVE_FALLBACK_MODEL,
+                                          cap_reasoning=False,
+                                          max_tokens=max_tokens)
+        except requests.RequestException as exc:
+            return None, (jsonify({
+                "error": f"Narrative service unreachable: {type(exc).__name__}",
+            }), 502)
+        if retry_resp.status_code != 200:
+            return None, (jsonify({
+                "error": f"Narrative service error ({retry_resp.status_code})",
+            }), retry_resp.status_code)
+        text, err = _openrouter_extract_text(retry_resp)
+        if err is not None:
+            return None, err
+
+    if not text:
+        return None, (jsonify({"error": "The narrative came back empty"}), 502)
+
+    return text, None
 
 
 @app.route("/api/narrative", methods=["POST"])
@@ -2148,80 +2252,91 @@ def api_narrative():
         {"role": "user", "content": user_content},
     ]
 
-    def _call_openrouter(model: str, cap_reasoning: bool):
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": NARRATIVE_MAX_TOKENS,
-        }
-        if cap_reasoning:
-            # Leaves headroom in max_tokens for the actual answer even if
-            # the router lands on a reasoning model -- harmlessly ignored
-            # by models that don't support it.
-            payload["reasoning"] = {"max_tokens": NARRATIVE_REASONING_MAX_TOKENS}
-        return requests.post(
-            OPENROUTER_API_URL,
-            json=payload,
-            headers={"Authorization": f"Bearer {openrouter_key}",
-                     "Content-Type": "application/json",
-                     # Optional per OpenRouter's docs, but they use this to
-                     # attribute traffic on their public rankings page.
-                     "HTTP-Referer": "https://pro-flight-tracker-production.up.railway.app",
-                     "X-Title": "Pro Flight Tracker"},
-            timeout=45,
-        )
-
-    def _extract_text(resp):
-        """Returns (text, error_response_or_None)."""
-        try:
-            text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-        except (ValueError, KeyError, IndexError, TypeError):
-            return None, (jsonify({"error": "Narrative service returned an unexpected shape"}), 502)
-        return text, None
-
-    try:
-        resp = _call_openrouter(NARRATIVE_MODEL, cap_reasoning=True)
-    except requests.RequestException as exc:
-        return jsonify({
-            "error": f"Narrative service unreachable: {type(exc).__name__}",
-        }), 502
-
-    if resp.status_code != 200:
-        # Pass OpenRouter's own status through — the client's NarrativeError
-        # already has copy for 401/402/429 and a generic fallback for others.
-        return jsonify({
-            "error": f"Narrative service error ({resp.status_code})",
-        }), resp.status_code
-
-    text, err = _extract_text(resp)
+    text, err = _openrouter_call_with_fallback(
+        openrouter_key, messages, max_tokens=NARRATIVE_MAX_TOKENS)
     if err is not None:
         return err
 
-    if not text:
-        # openrouter/free landed on a reasoning model that used its whole
-        # budget thinking and never wrote a final answer. Retry once
-        # against a pinned non-reasoning free model instead of re-rolling
-        # the same random risk.
-        try:
-            retry_resp = _call_openrouter(NARRATIVE_FALLBACK_MODEL, cap_reasoning=False)
-        except requests.RequestException as exc:
-            return jsonify({
-                "error": f"Narrative service unreachable: {type(exc).__name__}",
-            }), 502
-        if retry_resp.status_code != 200:
-            return jsonify({
-                "error": f"Narrative service error ({retry_resp.status_code})",
-            }), retry_resp.status_code
-        text, err = _extract_text(retry_resp)
-        if err is not None:
-            return err
-
-    if not text:
-        return jsonify({"error": "The narrative came back empty"}), 502
-
     _narrative_cache_put(cache_key, text)
     return jsonify({"narrative": text, "cached": False}), 200
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """Interactive follow-up chat about one flight, grounded in the same
+    `facts` the narrative feature uses (from /api/brief's `llm_payload.
+    facts`) plus the running conversation so far.
+
+    Body: {
+      "flight": str, "date": str,       # for the system prompt's framing
+      "facts": <json>,                   # the same facts object as /api/narrative
+      "messages": [{"role": "user"|"assistant", "content": str}, ...]
+    }
+    The client owns conversation history and resends it each turn --
+    the server is stateless and rebuilds the system prompt fresh every
+    request, so there's nothing to expire or clean up between calls.
+    Response: {"reply": str}.
+    """
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_key:
+        return jsonify({
+            "error": "AI chat is not configured on the server",
+            "hint": "Set OPENROUTER_API_KEY on Railway (create a key at "
+                    "https://openrouter.ai/settings/keys)",
+        }), 501
+
+    body = request.get_json(silent=True) or {}
+    flight = (body.get("flight") or "").strip()
+    date = (body.get("date") or "").strip()
+    facts = body.get("facts")
+    raw_messages = body.get("messages")
+
+    if not flight or not date:
+        return jsonify({"error": "Both 'flight' and 'date' are required"}), 400
+    if facts is None:
+        return jsonify({"error": "'facts' is required"}), 400
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return jsonify({"error": "'messages' must be a non-empty list"}), 400
+
+    facts_chars = len(json.dumps(facts, sort_keys=True, default=str))
+    if facts_chars > CHAT_MAX_FACTS_CHARS:
+        return jsonify({"error": "'facts' is too large"}), 400
+
+    cleaned = []
+    for m in raw_messages:
+        if not isinstance(m, dict):
+            return jsonify({"error": "Each message must be an object"}), 400
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            return jsonify({
+                "error": "Each message needs role 'user'/'assistant' and non-empty content",
+            }), 400
+        if len(content) > CHAT_MAX_MESSAGE_CHARS:
+            content = content[:CHAT_MAX_MESSAGE_CHARS]
+        cleaned.append({"role": role, "content": content})
+
+    if cleaned[-1]["role"] != "user":
+        return jsonify({"error": "The last message must be from 'user'"}), 400
+
+    # Keep only the most recent turns -- bounds both the request size sent
+    # to OpenRouter and how many free-tier calls one runaway conversation
+    # can rack up against the shared daily quota.
+    if len(cleaned) > CHAT_MAX_MESSAGES:
+        cleaned = cleaned[-CHAT_MAX_MESSAGES:]
+        if cleaned[0]["role"] != "user":
+            cleaned = cleaned[1:]
+
+    system = analysis.build_chat_system_prompt(flight, date, facts)
+    messages = [{"role": "system", "content": system}] + cleaned
+
+    text, err = _openrouter_call_with_fallback(
+        openrouter_key, messages, max_tokens=CHAT_MAX_TOKENS,
+        reasoning_max_tokens=CHAT_REASONING_MAX_TOKENS)
+    if err is not None:
+        return err
+
+    return jsonify({"reply": text}), 200
 
 
 # ============================================================================
