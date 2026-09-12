@@ -93,7 +93,7 @@ def test_health_is_exempt_from_auth():
             os.environ, {"API_TOKEN": "server-token-16", "REQUIRE_AUTH": "1"}):
         resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.get_json()["version"] == "1.12"
+    assert resp.get_json()["version"] == "1.13"
 
 
 if __name__ == "__main__":
