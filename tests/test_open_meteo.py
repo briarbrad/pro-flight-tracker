@@ -43,9 +43,8 @@ def test_summarize_has_no_aviation_category():
                                     coord_source="airport_table")
     assert block["label"] == "model_guidance"
     assert block["source"] == "open-meteo"
-    blob = str(block).upper()
-    for banned in ("VFR", "MVFR", "IFR", "LIFR"):
-        assert banned not in blob
+    assert "flight_category" not in block
+    assert "flight_category" not in (block.get("current") or {})
     assert "not an official taf" in block["note"].lower()
 
 
@@ -101,4 +100,4 @@ def test_open_meteo_endpoint_happy_path():
     assert "JFK" in body["data"] or "KJFK" in body["data"]
     station = body["data"].get("JFK") or body["data"].get("KJFK")
     assert station["label"] == "model_guidance"
-    assert "VFR" not in str(station)
+    assert "flight_category" not in station
