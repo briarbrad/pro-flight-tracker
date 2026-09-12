@@ -56,8 +56,8 @@ Full reference with response shapes lives in [RORK_BRIEF.md](RORK_BRIEF.md).
 |---|---|---|---|
 | Health | `/health` | free | instant |
 | Flight | `/api/flight/status`, `/chain`, `/track` | **AeroAPI** | 1–5s |
-| Weather | `/api/weather/metar`, `/taf`, `/sigmet`, `/isigmet`, `/pirep`, `/faa-status`, `/brief` | free | 1–3s |
-| Airport ops | `/api/ops/gairmet`, `/tcf`, `/lightning`, `/rvr`, `/atfm` | free | 1–20s |
+| Weather | `/api/weather/metar`, `/taf`, `/sigmet`, `/isigmet`, `/pirep`, `/faa-status`, `/brief`, `/open-meteo` | free | 1–3s |
+| Airport ops | `/api/ops/gairmet`, `/tcf`, `/lightning`, `/rvr`, `/atfm`, `/flow-brief` | free | 1–25s (flow-brief is SWIM-capped) |
 | FAA SWIM | `/api/swim/{tbfm,sfdps,itws,notams,stdds,tfms-flight,tfms-flow,tfdm}` | free | duration + ~4s |
 | Aggregate | `/api/check` | **AeroAPI** | 30–60s |
 | Analysis | `/api/brief` | **AeroAPI** (2–4) | 5–40s, scales with phase + horizon |
@@ -85,6 +85,7 @@ eight SWIM feeds are free to call as often as useful.
 | TCF | none | airport_ops.py | TFM Convective Forecast — thunderstorm coverage driving FAA ground stops/reroutes |
 | Blitzortung | none | airport_ops.py | Live lightning (ramp closure risk) |
 | FAA RVR | none | airport_ops.py | Per-runway visual range |
+| Open-Meteo | none | aviation_weather.py | Model guidance (precip/gusts/visibility) when TAF is thin — not a TAF |
 | SWIM TBFM | SWIM password | swim_consumer.py | ATC arrival metering |
 | SWIM SFDPS | SWIM password | swim_consumer.py | NAS flight positions (FIXM) |
 | SWIM ITWS | SWIM password | swim_consumer.py | Wind shear, gust fronts, microbursts |
@@ -103,6 +104,7 @@ pro-flight-tracker/
 ├── store.py                Tracking store (Postgres / in-memory) + leader election
 ├── analysis.py             Flight phase, horizon gating, Branch A/B,
 │                           taxi/position analysis, LLM prompt payload
+├── flow_brief.py           ATC flow-brief adapters (TFMS/TBFM/TFDM → JSON)
 ├── swim_daemon.py          Persistent SWIM consumer (leader process only)
 ├── Dockerfile              Python 3.12 + Java 25. Copies files BY NAME —
 │                             a new top-level module must be added here
@@ -115,7 +117,7 @@ pro-flight-tracker/
 ├── tests/                  Pytest regressions (not copied into the image)
 ├── scripts/
 │   ├── flight_data.py      AeroAPI + ADS-B + OpenSky
-│   ├── aviation_weather.py METAR/TAF/SIGMET/PIREP/FAA status
+│   ├── aviation_weather.py METAR/TAF/SIGMET/PIREP/FAA status + Open-Meteo
 │   ├── airport_ops.py      G-AIRMET/lightning/RVR/ATFM
 │   └── swim_consumer.py    All 8 SWIM feeds via JMS
 ├── swim/
@@ -161,10 +163,21 @@ to 50; pass `limit=` (clamped 1–200) to raise it.
 
 ## Version history
 
-`/health` reports `"version": "1.10"`. Bump that string, this list, and
+`/health` reports `"version": "1.11"`. Bump that string, this list, and
 RORK_BRIEF.md together on every behavior change.
 
-- **v1.10** (current) — Correctness / spend / auth hardening:
+- **v1.11** (current) — ATC flow brief + richer same-day nerd data:
+  - `GET /api/ops/flow-brief` — parallel TFMS-flow / TBFM / TFDM with
+    bounded listen (4–12s), interpreted `advisories` / `metering` /
+    `surface` / `effects`. Quiet or undeployed feeds are empty 200s.
+  - `/api/brief` now turns consulted `gairmet` into `effects[]`, and
+    runs the Eurocontrol CTOT heuristic on the already-paid status
+    payload (no extra AeroAPI query) when the destination is European.
+  - `/api/flight/live` gets the same free ATFM heuristic when cheap.
+  - `GET /api/weather/open-meteo` plus a compact `extended_weather`
+    block on long-horizon briefs. Labelled model guidance — never a TAF
+    category. No API key.
+- **v1.10** — Correctness / spend / auth hardening:
   - Background tracker now reuses the Phase 1 status payload when it runs
     `chain`, matching `/api/check` and `/api/brief`. It had been the last
     path still re-buying `/flights/{ident}` on every equipment-chain poll.

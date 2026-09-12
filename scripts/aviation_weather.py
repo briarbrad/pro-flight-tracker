@@ -20,6 +20,7 @@ Usage:
     python3 aviation_weather.py pirep   --icao KJFK [--distance 200]
     python3 aviation_weather.py faa-status --icao KJFK KLGA
     python3 aviation_weather.py brief   --origin KJFK --dest KLAX
+    python3 aviation_weather.py open-meteo --icao KJFK [KLHR]
 """
 
 import argparse
@@ -840,6 +841,183 @@ def fetch_brief(origin: str, dest: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Open-Meteo (no API key) — model guidance, not a TAF
+# ---------------------------------------------------------------------------
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_NOTE = (
+    "Numerical weather model guidance via Open-Meteo (no API key). "
+    "Not an official TAF or METAR. Do not treat these values as overriding "
+    "a TAF when one covers the same window, and do not invent aviation "
+    "flight categories (VFR/IFR) from this block."
+)
+
+# Reuse the ops table when the script is imported alongside airport_ops
+# (Flask does that). Fallback: AWC stationinfo, then Open-Meteo geocoding.
+def _airport_coords(icao: str):
+    """Return ((lat, lon), source) or (None, reason)."""
+    try:
+        import airport_ops as _ops
+        pair = (_ops.AIRPORT_COORDS or {}).get(icao)
+        if pair:
+            return pair, "airport_table"
+    except Exception:
+        pass
+
+    try:
+        raw = _fetch(f"{AWX_BASE}/stationinfo?ids={icao}&format=json")
+        items = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        if isinstance(items, list) and items:
+            lat, lon = items[0].get("lat"), items[0].get("lon")
+            if lat is not None and lon is not None:
+                return (float(lat), float(lon)), "awc_stationinfo"
+    except Exception:
+        pass
+
+    try:
+        raw = _fetch(f"{OPEN_METEO_GEOCODE_URL}?name={icao}&count=1&format=json")
+        geo = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        results = geo.get("results") or []
+        if results:
+            return (float(results[0]["latitude"]),
+                    float(results[0]["longitude"])), "open_meteo_geocode"
+    except Exception:
+        pass
+
+    return None, f"No coordinates for {icao}"
+
+
+def _knots(value) -> float | None:
+    """Round a numeric wind already in knots (Open-Meteo `wind_speed_unit=kn`)."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize_open_meteo(raw: dict, icao: str, hours: int = 12,
+                         coords=None, coord_source: str = None) -> dict:
+    """Collapse an Open-Meteo forecast JSON into a compact airport block.
+
+    Pure function so tests can feed fixtures. Never emits VFR/MVFR/IFR.
+    """
+    hours = max(1, min(int(hours or 12), 48))
+    current = raw.get("current") if isinstance(raw.get("current"), dict) else {}
+    hourly = raw.get("hourly") if isinstance(raw.get("hourly"), dict) else {}
+
+    times = hourly.get("time") or []
+    precip_p = hourly.get("precipitation_probability") or []
+    precip = hourly.get("precipitation") or []
+    gusts = hourly.get("wind_gusts_10m") or []
+    winds = hourly.get("wind_speed_10m") or []
+    vis = hourly.get("visibility") or []
+    cloud = hourly.get("cloud_cover") or []
+
+    near = []
+    n = min(hours, len(times))
+    for i in range(n):
+        near.append({
+            "time": times[i],
+            "precip_probability_pct": precip_p[i] if i < len(precip_p) else None,
+            "precip_mm": precip[i] if i < len(precip) else None,
+            "wind_kts": _knots(winds[i]) if i < len(winds) else None,
+            "wind_gust_kts": _knots(gusts[i]) if i < len(gusts) else None,
+            "visibility_m": vis[i] if i < len(vis) else None,
+            "cloud_cover_pct": cloud[i] if i < len(cloud) else None,
+        })
+
+    def _nums(key):
+        vals = []
+        for row in near:
+            v = row.get(key)
+            if isinstance(v, (int, float)):
+                vals.append(v)
+        return vals
+
+    p6 = _nums("precip_probability_pct")[:6]
+    g6 = _nums("wind_gust_kts")[:6]
+    v6 = _nums("visibility_m")[:6]
+
+    return {
+        "icao": icao,
+        "label": "model_guidance",
+        "source": "open-meteo",
+        "coord_source": coord_source,
+        "coords": ({"lat": coords[0], "lon": coords[1]} if coords else None),
+        "current": {
+            "time": current.get("time"),
+            "temp_c": current.get("temperature_2m"),
+            "precip_mm": current.get("precipitation"),
+            "weather_code": current.get("weather_code"),
+            "wind_kts": _knots(current.get("wind_speed_10m")),
+            "wind_gust_kts": _knots(current.get("wind_gusts_10m")),
+            "visibility_m": current.get("visibility"),
+        },
+        "hourly": near,
+        "next_6h": {
+            "max_precip_probability_pct": max(p6) if p6 else None,
+            "max_wind_gust_kts": max(g6) if g6 else None,
+            "min_visibility_m": min(v6) if v6 else None,
+        },
+        "note": OPEN_METEO_NOTE,
+    }
+
+
+def fetch_open_meteo(icao_codes: list, hours: int = 12) -> dict:
+    """Fetch Open-Meteo forecasts for one or more ICAO codes. No API key."""
+    hours = max(1, min(int(hours or 12), 48))
+    errors = []
+    data = {}
+    params = (
+        "current=temperature_2m,precipitation,weather_code,"
+        "wind_speed_10m,wind_gusts_10m,visibility"
+        "&hourly=precipitation_probability,precipitation,visibility,"
+        "wind_gusts_10m,wind_speed_10m,cloud_cover"
+        "&wind_speed_unit=kn&timezone=UTC"
+        f"&forecast_days=3"
+    )
+
+    for raw_code in icao_codes:
+        icao = (raw_code or "").upper().strip()
+        if not icao:
+            continue
+        coords, src = _airport_coords(icao)
+        if not coords:
+            errors.append(src)
+            data[icao] = {
+                "icao": icao, "label": "model_guidance",
+                "source": "open-meteo", "error": src,
+                "note": OPEN_METEO_NOTE,
+            }
+            continue
+        lat, lon = coords
+        url = (f"{OPEN_METEO_URL}?latitude={lat}&longitude={lon}&{params}")
+        try:
+            raw = _fetch(url)
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            data[icao] = summarize_open_meteo(payload, icao, hours=hours,
+                                              coords=coords, coord_source=src)
+        except Exception as exc:
+            errors.append(f"{icao}: {exc}")
+            data[icao] = {
+                "icao": icao, "label": "model_guidance",
+                "source": "open-meteo", "error": str(exc),
+                "coords": {"lat": lat, "lon": lon},
+                "note": OPEN_METEO_NOTE,
+            }
+
+    return {
+        "data": data,
+        "errors": errors,
+        "label": "model_guidance",
+        "note": OPEN_METEO_NOTE,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1070,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_brief.add_argument("--dest", required=True,
                          help="Destination ICAO code")
 
+    # open-meteo
+    p_om = sub.add_parser("open-meteo",
+                          help="Open-Meteo model guidance (no API key; "
+                               "not a TAF)")
+    p_om.add_argument("--icao", nargs="+", required=True,
+                      help="ICAO airport codes")
+    p_om.add_argument("--hours", type=int, default=12,
+                      help="Hourly horizon to retain (1-48, default 12)")
+
     return parser
 
 
@@ -918,6 +1105,9 @@ def dispatch(args) -> dict:
         result = fetch_faa_status(args.icao)
     elif args.command == "brief":
         result = fetch_brief(args.origin, args.dest)
+    elif args.command == "open-meteo":
+        hours = getattr(args, "hours", 12)
+        result = fetch_open_meteo(args.icao, hours=hours)
     else:
         return {"error": f"Unknown command: {args.command!r}"}
 

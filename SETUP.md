@@ -55,10 +55,15 @@ In Railway dashboard → your service → **Variables** tab, add these:
 |---|---|---|
 | `ADSB_EXCHANGE_KEY` | ADS-B Exchange RapidAPI key | [rapidapi.com/adsbexchange](https://rapidapi.com/adsbexchange/api/adsbexchange-com1) — Free tier available |
 | `OPENSKY_API_KEY` | OpenSky Network credentials | [opensky-network.org](https://opensky-network.org/) — Free account, format: `username:password` |
-| `WEATHER_USER_AGENT` | User-Agent for weather APIs | Any string, e.g. `ProFlightTracker/1.10 (your@email.com)` |
+| `WEATHER_USER_AGENT` | User-Agent for weather APIs | Any string, e.g. `ProFlightTracker/1.11 (your@email.com)` |
 | `API_TOKEN` / `REQUIRE_AUTH` | Optional bearer auth | Dormant until `REQUIRE_AUTH=1`. See README. |
 | `RATE_LIMIT_PER_MIN` | Per-worker request cap | Default `60`, always on |
 | `DATABASE_URL` | Postgres (tracking + SWIM daemon) | Injected automatically when you add Railway Postgres. `postgres://` is rewritten to `postgresql://` |
+
+Open-Meteo (`/api/weather/open-meteo` and brief `extended_weather`) needs
+**no API key**. G-AIRMET, TCF, METAR/TAF, and FAA NAS are the same. Do not
+add paid weather keys unless a future product gap requires it — if one is
+added, put it in an env var and degrade when unset.
 
 ### Pre-Set (Already in Config)
 
@@ -87,7 +92,7 @@ Expected response:
 {
   "status": "ok",
   "service": "pro-flight-tracker",
-  "version": "1.10",
+  "version": "1.11",
   "timestamp": "2026-09-12T15:30:00Z",
   "store": {"backend": "postgres", "ok": true},
   "tracker_leader": true,

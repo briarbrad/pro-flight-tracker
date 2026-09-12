@@ -35,6 +35,7 @@ from flask_cors import CORS
 
 import store
 import analysis
+import flow_brief
 
 # The data scripts are importable modules — run them in-process instead of
 # paying a ~100-300ms interpreter spawn per call. swim_consumer.py is NOT
@@ -456,6 +457,7 @@ _TTL_BY_CALL = {
     ("aviation_weather.py", "pirep"): 600,
     ("aviation_weather.py", "faa-status"): 300,
     ("aviation_weather.py", "brief"): 300,
+    ("aviation_weather.py", "open-meteo"): 1800,
     ("airport_ops.py", "gairmet"): 1800,
     ("airport_ops.py", "tcf"): 1800,
     ("airport_ops.py", "lightning"): 60,
@@ -553,6 +555,7 @@ def _nocache_requested() -> bool:
 _RESULT_CONTENT_KEYS = (
     "data", "flights", "results", "route", "strikes", "ramp_alerts",
     "conditions", "forecast", "advisories", "records", "position",
+    "current", "hourly", "near_term", "extended_weather", "metering",
 )
 
 
@@ -586,7 +589,11 @@ def _upstream_for(script: str, args: list) -> str:
     if script == "swim_consumer.py":
         return "swim"
     if script == "aviation_weather.py":
-        return "faa_nas" if sub == "faa-status" else "awc"
+        if sub == "faa-status":
+            return "faa_nas"
+        if sub == "open-meteo":
+            return "open_meteo"
+        return "awc"
     if script == "airport_ops.py":
         return {"lightning": "blitzortung", "rvr": "faa_rvr",
                 "atfm-infer": "aeroapi"}.get(sub, "awc")
@@ -749,6 +756,19 @@ _FAA_TO_ICAO = {
 }
 _ICAO_TO_FAA = {v: k for k, v in _FAA_TO_ICAO.items()}
 
+# Major non-US IATA → ICAO. A client sending dest=LHR (or the mistaken
+# dest=KLHR) must not become "KLHR", which is not a real airport.
+_IATA_TO_ICAO_INTL = {
+    "LHR": "EGLL", "LGW": "EGKK", "LCY": "EGLC", "STN": "EGSS", "MAN": "EGCC",
+    "CDG": "LFPG", "ORY": "LFPO", "FCO": "LIRF", "MXP": "LIMC", "NAP": "LIRN",
+    "AMS": "EHAM", "FRA": "EDDF", "MUC": "EDDM", "MAD": "LEMD", "BCN": "LEBL",
+    "DUB": "EIDW", "ZRH": "LSZH", "VIE": "LOWW", "CPH": "EKCH", "ARN": "ESSA",
+    "HEL": "EFHK", "LIS": "LPPT", "ATH": "LGAV", "IST": "LTFM", "WAW": "EPWA",
+    "PRG": "LKPR", "DXB": "OMDB", "DOH": "OTHH", "HND": "RJTT", "NRT": "RJAA",
+    "HKG": "VHHH", "SIN": "WSSS", "SYD": "YSSY", "YYZ": "CYYZ", "YUL": "CYUL",
+    "MEX": "MMMX", "CTA": "LICC", "BGY": "LIME", "BRU": "EBBR", "OSL": "ENGM",
+}
+
 
 def _is_conus(icao: str) -> bool:
     """True for contiguous-US ICAO codes (the domestic /airsigmet coverage
@@ -764,9 +784,14 @@ def to_icao(code: str) -> str:
     if not c:
         return ""
     if len(c) == 4:
+        # dest=KLHR is a common client mistake (K + IATA). Map it.
+        if c.startswith("K") and c[1:] in _IATA_TO_ICAO_INTL:
+            return _IATA_TO_ICAO_INTL[c[1:]]
         return c
     if len(c) == 3:
-        return _FAA_TO_ICAO.get(c, "K" + c)
+        return (_FAA_TO_ICAO.get(c)
+                or _IATA_TO_ICAO_INTL.get(c)
+                or ("K" + c))
     return c
 
 
@@ -913,7 +938,7 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.10",
+        "version": "1.11",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
@@ -1078,6 +1103,30 @@ def weather_brief():
     return jsonify(data), status
 
 
+@app.route("/api/weather/open-meteo")
+def weather_open_meteo():
+    """Open-Meteo model guidance for one or more airports. No API key.
+
+    Labelled `model_guidance` — not a TAF. Does not invent VFR/IFR
+    categories. Useful when the official TAF is thin or the horizon is
+    past TAF coverage.
+    """
+    codes, mapping = airport_list(request.args.get("icao", ""))
+    hours = int(clean_duration(request.args.get("hours", ""), 12, lo=1, hi=48))
+    if not codes:
+        return jsonify({
+            "error": "Missing or invalid 'icao' parameter",
+            "hint": "Airport code(s), comma-separated. Both 'JFK' and 'KJFK' "
+                    "work; 'LHR' resolves to EGLL.",
+        }), 400
+
+    data, status = run_script(
+        "aviation_weather.py",
+        ["open-meteo", "--icao"] + codes + ["--hours", str(hours)],
+        timeout=15)
+    return jsonify(rekey_airports(data, mapping)), status
+
+
 # ============================================================================
 # AIRPORT OPERATIONS ENDPOINTS
 # ============================================================================
@@ -1164,6 +1213,183 @@ def ops_atfm():
 
     data, status = run_script("airport_ops.py", args)
     return jsonify(data), status
+
+
+@app.route("/api/ops/flow-brief")
+def ops_flow_brief():
+    """Interpreted ATC flow brief from TFMS-flow + TBFM + TFDM.
+
+    Pulls the three SWIM feeds in parallel with a hard wall-clock cap.
+    Quiet / undeployed / non-US feeds return empty structures (HTTP 200),
+    never a 500. The client can render `advisories`, `metering`, `surface`,
+    and `effects` without re-deriving meaning.
+
+    Query params (all optional except at least one of flight / origin / dest):
+      flight   e.g. DL244 — used for TBFM/TFDM callsign match and, if
+               origin/dest are omitted, one AeroAPI status lookup
+      date     YYYY-MM-DD (only needed when resolving airports from flight)
+      origin / dest / departure / destination / arrival
+      duration SWIM listen seconds, clamped 4–12 (default 8)
+    """
+    flight = clean_ident(request.args.get("flight", ""))
+    date = clean_date(request.args.get("date", ""))
+    origin = to_icao(request.args.get("origin", "")
+                     or request.args.get("departure", ""))
+    dest = to_icao(request.args.get("dest", "")
+                   or request.args.get("destination", "")
+                   or request.args.get("arrival", ""))
+    duration = int(clean_duration(request.args.get("duration", ""), 8,
+                                  lo=4, hi=12))
+
+    if not flight and not origin and not dest:
+        return jsonify({
+            "error": "Need at least one of flight, origin, or dest",
+            "hint": "e.g. flight=DL244&origin=KJFK&dest=EGLL  "
+                    "(LHR and KLHR both resolve to EGLL)",
+        }), 400
+
+    aeroapi_queries = 0
+    if (not origin or not dest) and flight:
+        if not date:
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        status_data, status_code = run_script(
+            "flight_data.py", ["status", "--flight", flight, "--date", date],
+            timeout=20)
+        aeroapi_queries = 1
+        resolved_o, resolved_d = _extract_origin_dest_icao(status_data, status_code)
+        origin = origin or resolved_o
+        dest = dest or resolved_d
+
+    if not origin and not dest:
+        return jsonify({
+            "error": "Could not resolve origin or destination",
+            "hint": "Pass origin= and dest= (ICAO or IATA) or a flight that "
+                    "AeroAPI can resolve.",
+            "aeroapi_queries_used": aeroapi_queries,
+        }), 400
+
+    swim_callsign = ""
+    if flight:
+        swim_callsign = _iata_to_icao_airline(flight[:2]) + flight[2:]
+
+    # Per-script timeout must exceed --duration by JVM startup (~10-15s).
+    # The request-level deadline is what keeps the endpoint from hanging.
+    per_timeout = duration + 14
+    deadline = time.monotonic() + max(18, duration + 16)
+
+    tasks = []
+    sources_tried = []
+    sources_skipped = []
+
+    if origin and flow_brief.is_us_nas(origin):
+        tasks.append({
+            "key": "tfms_flow_origin",
+            "script": "swim_consumer.py",
+            "args": ["tfms-flow", "--airport", origin,
+                     "--duration", str(duration), "--limit", "80"],
+            "timeout": per_timeout,
+        })
+        sources_tried.append("tfms-flow:origin")
+    elif origin:
+        sources_skipped.append("tfms-flow:origin")
+
+    if dest and flow_brief.is_us_nas(dest) and dest != origin:
+        tasks.append({
+            "key": "tfms_flow_dest",
+            "script": "swim_consumer.py",
+            "args": ["tfms-flow", "--airport", dest,
+                     "--duration", str(duration), "--limit", "80"],
+            "timeout": per_timeout,
+        })
+        sources_tried.append("tfms-flow:dest")
+    elif dest and dest != origin:
+        sources_skipped.append("tfms-flow:dest")
+
+    if dest and flow_brief.is_us_nas(dest):
+        tbfm_args = ["tbfm", "--airport", dest,
+                     "--duration", str(duration), "--limit", "50"]
+        if swim_callsign:
+            tbfm_args += ["--flight", swim_callsign]
+        tasks.append({
+            "key": "tbfm",
+            "script": "swim_consumer.py",
+            "args": tbfm_args,
+            "timeout": per_timeout,
+        })
+        sources_tried.append("tbfm")
+    else:
+        sources_skipped.append("tbfm")
+
+    if origin and flow_brief.is_tfdm_airport(origin):
+        tfdm_args = ["tfdm", "--airport", origin,
+                     "--duration", str(duration), "--limit", "80"]
+        if swim_callsign:
+            tfdm_args += ["--flight", swim_callsign]
+        tasks.append({
+            "key": "tfdm_origin",
+            "script": "swim_consumer.py",
+            "args": tfdm_args,
+            "timeout": per_timeout,
+        })
+        sources_tried.append("tfdm:origin")
+    else:
+        sources_skipped.append("tfdm:origin")
+
+    if dest and dest != origin and flow_brief.is_tfdm_airport(dest):
+        tfdm_d_args = ["tfdm", "--airport", dest,
+                       "--duration", str(duration), "--limit", "80"]
+        if swim_callsign:
+            tfdm_d_args += ["--flight", swim_callsign]
+        tasks.append({
+            "key": "tfdm_dest",
+            "script": "swim_consumer.py",
+            "args": tfdm_d_args,
+            "timeout": per_timeout,
+        })
+        sources_tried.append("tfdm:dest")
+    elif dest and dest != origin:
+        sources_skipped.append("tfdm:dest")
+
+    t0 = time.monotonic()
+    raw = run_scripts_parallel(tasks, max_workers=6, deadline=deadline) if tasks else {}
+    timings = {"total": round(time.monotonic() - t0, 2)}
+
+    swim = {}
+    sources_quiet = list(sources_skipped)
+    for key, result in raw.items():
+        # run_scripts_parallel doesn't return per-task elapsed; approximate
+        # from the batch. Individual keys still get an entry.
+        timings[key] = timings.get("total")
+        payload = result.get("data") if isinstance(result, dict) else None
+        swim[key] = payload if isinstance(payload, dict) else {"results": []}
+        results = (payload or {}).get("results") if isinstance(payload, dict) else None
+        errored = (isinstance(payload, dict) and payload.get("error")
+                   and not results)
+        empty = not results
+        if result.get("status") != 200 or errored or empty:
+            if key not in sources_quiet:
+                sources_quiet.append(key)
+
+    # Alias keys the assembler looks for.
+    if "tfdm_origin" in swim and "tfdm" not in swim:
+        swim["tfdm"] = swim["tfdm_origin"]
+
+    generated = datetime.now(timezone.utc).isoformat()
+    brief = flow_brief.assemble_flow_brief(
+        flight=flight or None,
+        date=date or None,
+        origin=origin or None,
+        dest=dest or None,
+        swim=swim,
+        timings=timings,
+        sources_tried=sources_tried,
+        sources_quiet=sources_quiet,
+        aeroapi_queries_used=aeroapi_queries,
+    )
+    brief["generated_at"] = generated
+    brief["duration_seconds"] = duration
+    brief["sources_skipped"] = sources_skipped
+    return jsonify(brief), 200
 
 
 # ============================================================================
@@ -1697,10 +1923,28 @@ def flight_live():
     # Verdict-lite: same assess() as the brief, fed only status-derived
     # inputs — no FAA programs, no weather effects, and turn analysis only
     # when a recent brief already found one (see cached_turn above).
+    # ATFM is the one extra that's free here: it scores this same status
+    # payload when the destination is European. No new AeroAPI query,
+    # no SWIM, no G-AIRMET HTTP — those stay on /api/brief.
     plan = analysis.source_plan(horizon["hours_to_next_event"], phase)
+    atfm = {}
+    atfm_fx = []
+    if dest and _mod_airport_ops._is_eurocontrol(dest):
+        hours = horizon.get("hours_to_next_event")
+        if hours is None or hours <= 12:
+            atfm = _mod_airport_ops.infer_atfm_from_status(primary)
+            atfm_fx = analysis.atfm_effects(atfm)
+    else:
+        plan["atfm"] = {
+            "relevant": False,
+            "reason": (f"Destination {dest} is not in Eurocontrol airspace"
+                       if dest else "No destination"),
+            "provides": "Eurocontrol CTOT heuristic",
+        }
     branch = analysis.classify_branch(horizon, [], turn_analysis, plan, [])
     effects = (analysis.build_effects(primary, [], turn_analysis, edct, horizon)
-               + analysis.taxi_effects(taxi, edct))
+               + analysis.taxi_effects(taxi, edct)
+               + atfm_fx)
     verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects,
                               taxi, phase)
     verdict["scope"] = "status_only"
@@ -1731,6 +1975,7 @@ def flight_live():
                                 "note": "No fresh cached turn-time finding — "
                                         "run a brief to check inbound "
                                         "equipment"}),
+        "atfm": atfm or {"applicable": False},
         "delay_trend": _record_and_get_delay_trend(flight, date, primary,
                                                     verdict.get("departure_risk")),
         "refresh_after_seconds": analysis.refresh_interval(phase, horizon),
@@ -1813,6 +2058,17 @@ def flight_brief():
     dest = primary.get("dest_icao")
     airports = [a for a in (origin, dest) if a]
 
+    # ATFM is in SOURCE_HORIZON (12h) but only means something for a
+    # European arrival. Override the plan so sources_excluded says so
+    # instead of pretending we consulted Eurocontrol for KJFK–KLAX.
+    if dest and not _mod_airport_ops._is_eurocontrol(dest):
+        plan["atfm"] = {
+            "relevant": False,
+            "reason": f"Destination {dest} is not in Eurocontrol airspace",
+            "provides": plan.get("atfm", {}).get("provides",
+                "Eurocontrol CTOT heuristic"),
+        }
+
     # --- Step 3: fetch only what the horizon justifies.
     tasks = []
     if plan["taf"]["relevant"] and airports:
@@ -1850,6 +2106,12 @@ def flight_brief():
     if plan["rvr"]["relevant"] and origin:
         tasks.append({"key": "rvr", "script": "airport_ops.py",
                       "args": ["rvr", "--airport", to_faa(origin)], "timeout": 15})
+    if horizon.get("band") in ("SAME_DAY", "NEXT_DAY", "DISTANT") and airports:
+        # Free, fast, no key. TAF is the official product when it covers
+        # the window; this is labelled model_guidance for the gap beyond.
+        tasks.append({"key": "open_meteo", "script": "aviation_weather.py",
+                      "args": ["open-meteo", "--icao"] + airports,
+                      "timeout": 12})
     if plan["position"]["relevant"]:
         # Answers "where is it and is it actually moving" once the aircraft
         # is out of the gate. ADS-B and OpenSky are free and tried first;
@@ -1985,11 +2247,40 @@ def flight_brief():
         taf_windows["arrival"] = arr_taf
         weather_effects += analysis.taf_effects(arr_taf, "arrival")
 
+    # ATFM heuristic is free: it scores the status payload we already have.
+    # Never call atfm-infer here — that re-buys AeroAPI.
+    atfm = {}
+    if plan.get("atfm", {}).get("relevant"):
+        atfm = _mod_airport_ops.infer_atfm_from_status(primary)
+        sources["atfm"] = {
+            "status": "ok",
+            "relevance": "RELEVANT",
+            "provides": plan["atfm"].get("provides"),
+            "data": atfm,
+        }
+
+    gairmet_fx = analysis.gairmet_effects(
+        (sources.get("gairmet") or {}).get("data"))
+    atfm_fx = analysis.atfm_effects(atfm)
+
+    om_payload = (sources.get("open_meteo") or {}).get("data")
+    extended_weather = None
+    if isinstance(om_payload, dict) and om_payload.get("data"):
+        extended_weather = {
+            "label": "model_guidance",
+            "source": "open-meteo",
+            "note": om_payload.get("note") or getattr(
+                _mod_aviation_weather, "OPEN_METEO_NOTE", ""),
+            "airports": om_payload.get("data"),
+        }
+
     branch = analysis.classify_branch(horizon, programs, turn_analysis, plan,
                                       weather_effects)
     effects = (analysis.build_effects(primary, programs, turn_analysis,
                                       edct, horizon)
                + weather_effects
+               + gairmet_fx
+               + atfm_fx
                + analysis.taxi_effects(taxi, edct)
                + analysis.position_effects(position, phase))
     verdict = analysis.assess(horizon, branch, turn_analysis, primary, effects,
@@ -2000,6 +2291,12 @@ def flight_brief():
     effects.sort(key=lambda e: _sev.get(e.get("severity"), 3))
 
     excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
+    if extended_weather is None and horizon.get("band") not in (
+            "SAME_DAY", "NEXT_DAY", "DISTANT"):
+        excluded.setdefault(
+            "open_meteo",
+            "Near-term TAF/METAR still cover this horizon — Open-Meteo "
+            "model guidance is folded in at SAME_DAY and longer.")
 
     payload = analysis.build_llm_payload(flight, date, horizon, plan, branch,
                                          verdict, sources)
@@ -2011,6 +2308,14 @@ def flight_brief():
     payload["facts"]["phase"] = phase
     payload["facts"]["taxi"] = taxi
     payload["facts"]["position"] = position
+    if atfm:
+        payload["facts"]["atfm"] = atfm
+    if extended_weather:
+        payload["facts"]["extended_weather"] = extended_weather
+        payload["guardrails"].append(
+            "extended_weather is Open-Meteo model guidance, not a TAF. "
+            "Never invent VFR/IFR categories from it, and never let it "
+            "override a TAF that covers the same window.")
     payload["guardrails"].append(
         "Predicted gate/takeoff/arrival times and any EDCT are already "
         "computed and included in the facts. Report them with their stated "
@@ -2046,6 +2351,8 @@ def flight_brief():
         "effects": effects,
         "predicted_times": predictions,
         "taf_windows": taf_windows,
+        "atfm": atfm or {"applicable": False},
+        "extended_weather": extended_weather,
         "timezones": {"origin": origin_tz, "destination": dest_tz},
         "branch_classification": branch,
         "sources_consulted": sorted(k for k, v in sources.items()
