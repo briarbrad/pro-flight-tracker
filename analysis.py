@@ -722,6 +722,424 @@ def assess(horizon: dict, branch: dict, turn_analysis: dict,
 
 
 # ---------------------------------------------------------------------------
+# Simple-mode summary
+#
+# Deterministic, traveler-facing prose for the iOS Simple mode. Built only
+# from fields the brief (and the cheap live tile) already compute — no extra
+# AeroAPI, no model. Pro fields stay untouched; this is an extra block.
+# ---------------------------------------------------------------------------
+
+# ICAO → the 3-letter code a traveller actually says. K-prefix US airports
+# drop the K; this covers the common non-US ones that would otherwise leak
+# as EGLL / LFPG in a headline.
+_ICAO_TRAVELER = {
+    "EGLL": "LHR", "EGKK": "LGW", "EGLC": "LCY", "EGSS": "STN", "EGCC": "MAN",
+    "LFPG": "CDG", "LFPO": "ORY", "LIRF": "FCO", "LIMC": "MXP", "LIRN": "NAP",
+    "EHAM": "AMS", "EDDF": "FRA", "EDDM": "MUC", "LEMD": "MAD", "LEBL": "BCN",
+    "EIDW": "DUB", "LSZH": "ZRH", "LOWW": "VIE", "EKCH": "CPH", "ESSA": "ARN",
+    "EFHK": "HEL", "LPPT": "LIS", "LGAV": "ATH", "LTFM": "IST", "EPWA": "WAW",
+    "LKPR": "PRG", "OMDB": "DXB", "OTHH": "DOH", "RJTT": "HND", "RJAA": "NRT",
+    "VHHH": "HKG", "WSSS": "SIN", "YSSY": "SYD", "CYYZ": "YYZ", "CYUL": "YUL",
+    "MMMX": "MEX", "LICC": "CTA", "LIME": "BGY", "EBBR": "BRU", "ENGM": "OSL",
+    "PANC": "ANC", "PHNL": "HNL", "TJSJ": "SJU",
+}
+
+
+def traveler_airport(icao: str) -> str:
+    """KJFK → JFK, EGLL → LHR. Empty input stays empty."""
+    c = (icao or "").upper().strip()
+    if not c:
+        return ""
+    if len(c) == 3 and c.isalpha():
+        return c
+    mapped = _ICAO_TRAVELER.get(c)
+    if mapped:
+        return mapped
+    if len(c) == 4 and c.startswith("K"):
+        return c[1:]
+    return c
+
+
+def _floor_5(n) -> int:
+    return int(float(n) // 5) * 5
+
+
+def _lateness_span(delay_min) -> str | None:
+    """Traveler-friendly delay window: 'a few minutes' or '15–25 min'.
+
+    A 16-minute slip becomes 15–25, not a falsely precise '16 min' and not
+    a window that starts below the observed delay.
+    """
+    if delay_min is None:
+        return None
+    try:
+        delay_min = float(delay_min)
+    except (TypeError, ValueError):
+        return None
+    if delay_min <= 5:
+        return None
+    if delay_min < 12:
+        return "a few minutes"
+    low = max(10, _floor_5(delay_min))
+    high = low + 10
+    return f"{low}–{high} min"
+
+
+def _pred_delay(predicted_times: dict, *keys):
+    for key in keys:
+        entry = (predicted_times or {}).get(key) or {}
+        delay = entry.get("delay_vs_schedule_min")
+        if delay is not None:
+            return delay
+    return None
+
+
+def _too_early(horizon: dict, branch: dict) -> bool:
+    """Far enough out that a firm on-time call would be fake certainty."""
+    if (branch or {}).get("branch") == "NOT_APPLICABLE":
+        return True
+    return (horizon or {}).get("band") in ("DISTANT", "NEXT_DAY")
+
+
+def _action_effects(effects: list) -> list:
+    return [e for e in (effects or []) if e.get("severity") == "ACTION"]
+
+
+def _watch_effects(effects: list) -> list:
+    return [e for e in (effects or []) if e.get("severity") == "WATCH"]
+
+
+def _effect_mentions(effects: list, *needles) -> bool:
+    blob = " ".join(
+        f"{e.get('cause', '')} {e.get('effect', '')} {e.get('source', '')}"
+        for e in (effects or [])
+    ).lower()
+    return any(n.lower() in blob for n in needles)
+
+
+def _has_edct(predicted_times: dict, effects: list) -> bool:
+    pred = predicted_times or {}
+    if pred.get("edct"):
+        return True
+    takeoff = pred.get("takeoff") or {}
+    if takeoff.get("status") == "CONTROLLED":
+        return True
+    return _effect_mentions(effects, "edct", "swim_tfms")
+
+
+def _tight_inbound(effects: list) -> bool:
+    for e in (effects or []):
+        if e.get("source") != "equipment_chain":
+            continue
+        if e.get("severity") in ("ACTION", "WATCH"):
+            return True
+    return False
+
+
+def _bullet_from_effect(effect: dict) -> str | None:
+    """One traveler-facing bullet. Skips INFO / jargon."""
+    src = effect.get("source") or ""
+    cause = (effect.get("cause") or "").lower()
+    sev = effect.get("severity")
+    if src == "swim_tfms" or "edct" in cause:
+        return "FAA takeoff slot assigned"
+    if src == "equipment_chain":
+        if sev == "ACTION":
+            return "Inbound plane running tight"
+        if sev == "WATCH":
+            return "Inbound turn is tight"
+        return None
+    if src == "taxi":
+        if sev == "ACTION" or "extended" in cause:
+            return "Taxi is running long"
+        if sev == "WATCH":
+            return "Taxi a bit longer than usual"
+        return None
+    if src == "faa_status":
+        if "ground stop" in cause:
+            return "Ground stop at the airport"
+        if "ground delay program" in cause or "gdp" in cause:
+            return "Airport delay program in effect"
+        if "closure" in cause:
+            return "Airport closure in effect"
+        if "general delays" in cause or "arr_dep" in cause:
+            return "General airport delays"
+        return None
+    if src == "taf" and sev == "ACTION":
+        blob = cause + " " + (effect.get("effect") or "").lower()
+        if "arriv" in blob:
+            return "Poor weather around arrival"
+        return "Poor weather around departure"
+    if src == "atfm" and sev in ("WATCH", "ACTION"):
+        return "Possible European takeoff slot"
+    if src == "gairmet" and sev == "WATCH":
+        return "Turbulence forecast on the route"
+    if src == "position" and sev in ("WATCH", "ACTION"):
+        return "Aircraft holding on the ground"
+    return None
+
+
+def _basis_bullets(phase_name: str, too_early: bool, effects: list,
+                   extra: list = None) -> list:
+    bullets = []
+    seen = set()
+    for e in _action_effects(effects) + _watch_effects(effects):
+        b = _bullet_from_effect(e)
+        if b and b not in seen:
+            seen.add(b)
+            bullets.append(b)
+        if len(bullets) >= 4:
+            break
+    for b in extra or []:
+        if b and b not in seen:
+            seen.add(b)
+            bullets.append(b)
+    if bullets:
+        return bullets[:4]
+    if phase_name == "CANCELLED":
+        return ["Flight cancelled"]
+    if phase_name == "ARRIVED":
+        return ["Flight arrived"]
+    if too_early:
+        return ["Too early to judge", "Nothing worrying yet"]
+    return ["Nothing worrying yet"]
+
+
+def _on_time_ish_arrival(arr_delay) -> bool:
+    if arr_delay is None:
+        return True
+    try:
+        return float(arr_delay) <= 15
+    except (TypeError, ValueError):
+        return True
+
+
+def build_simple_summary(phase: dict = None, horizon: dict = None,
+                         verdict: dict = None, effects: list = None,
+                         predicted_times: dict = None, taxi: dict = None,
+                         branch: dict = None, origin: str = None,
+                         dest: str = None) -> dict:
+    """Plain-English prediction block for Simple mode.
+
+    Always returns the same keys. Tone is calm and traveler-facing: one
+    headline prediction, a short why, and a few jargon-free bullets.
+    Far-out / NOT_APPLICABLE horizons refuse fake green certainty.
+    """
+    phase = phase or {}
+    horizon = horizon or {}
+    verdict = verdict or {}
+    effects = effects or []
+    predicted_times = predicted_times or {}
+    taxi = taxi or {}
+    branch = branch or {}
+
+    phase_name = phase.get("phase") or horizon.get("phase") or ""
+    apt = traveler_airport(origin)
+    leaving = f" leaving {apt}" if apt else ""
+    confidence = verdict.get("confidence") or "LOW"
+    risk = verdict.get("departure_risk") or "LOW"
+    if _action_effects(effects) and risk == "LOW" and phase_name not in (
+            "ARRIVED", "CANCELLED", "TAXI_IN"):
+        # An assigned takeoff slot or a turn below minimum *is* a delay,
+        # even if the coarse verdict stayed LOW (it only escalates on
+        # branch / TAF ACTION / extended taxi).
+        risk = "MODERATE"
+
+    too_early = _too_early(horizon, branch)
+    has_action = bool(_action_effects(effects))
+    dep_delay = _pred_delay(predicted_times, "takeoff", "gate_departure")
+    arr_delay = _pred_delay(predicted_times, "gate_arrival")
+    late_span = _lateness_span(dep_delay)
+    arr_span = _lateness_span(arr_delay)
+    edct = _has_edct(predicted_times, effects)
+    inbound_tight = _tight_inbound(effects)
+    next_label = phase.get("next_event_label")
+    next_local = phase.get("next_event_local_display")
+
+    headline = ""
+    what = ""
+    extras = []
+
+    if phase_name == "CANCELLED":
+        headline = "This flight has been cancelled."
+        what = ("The airline cancelled it. There is nothing further to "
+                "predict — check the airline for rebooking.")
+        extras = ["Flight cancelled"]
+
+    elif phase.get("diverted") and phase_name != "ARRIVED":
+        headline = "This flight was diverted."
+        what = ("It's heading to a different airport than planned. Check "
+                "the airline for the new arrival.")
+        extras = ["Flight diverted"]
+
+    elif phase_name == "ARRIVED":
+        if phase.get("diverted"):
+            headline = "This flight was diverted and has arrived."
+            what = "It's at the gate, but not at the original destination."
+            extras = ["Flight diverted", "Flight arrived"]
+        elif arr_span:
+            headline = f"This flight has arrived, about {arr_span} late."
+            what = "It's at the gate. The trip is over."
+            extras = [f"Arrived about {arr_span} late"]
+        else:
+            headline = "This flight has arrived — on time."
+            what = "It's at the gate. The trip is over."
+            extras = ["Arrived on time"]
+
+    elif phase_name == "TAXI_IN":
+        headline = "Landed — heading to the gate now."
+        what = "Wheels are down. What's left is the taxi to the arrival gate."
+        extras = ["Landed, taxiing in"]
+
+    elif too_early and not has_action:
+        headline = "Too early for a firm call — nothing worrying yet"
+        hours = horizon.get("hours_to_departure")
+        if hours is not None:
+            try:
+                hrs = float(hours)
+                when = ("more than a day" if hrs >= 24
+                        else f"about {max(1, round(hrs))} hours")
+            except (TypeError, ValueError):
+                when = "still a long way"
+        else:
+            when = "still a long way"
+        what = (f"We're {when} from departure. The delay programs and "
+                "aircraft assignments that actually move a flight have "
+                "not been set yet, and nothing on the forecast looks "
+                "alarming. Check back later for a real prediction.")
+        extras = ["Too early to judge", "Nothing worrying yet"]
+
+    elif too_early and has_action:
+        weather_dep = _effect_mentions(
+            [e for e in effects if e.get("source") == "taf"],
+            "depart", "origin", "takeoff")
+        weather_arr = _effect_mentions(
+            [e for e in effects if e.get("source") == "taf"],
+            "arriv")
+        where = ("departure" if weather_dep or not weather_arr
+                 else "arrival")
+        if inbound_tight:
+            headline = ("Too early for a firm time — the inbound plane "
+                        "already looks tight.")
+            what = ("We're still far enough out that exact minutes would "
+                    "be a guess, but the plane for this flight is landing "
+                    "with less turn time than it needs. Worth watching.")
+        else:
+            headline = (f"Too early for a firm time — weather around "
+                        f"{where} looks like it could cause a delay.")
+            what = ("We're still far enough out that a precise clock time "
+                    "would be a guess. The forecast for that window is "
+                    "poor enough to watch, not to ignore.")
+
+    elif (taxi.get("applicable") and taxi.get("assessment") == "EXTENDED"
+          and taxi.get("phase") == "TAXI_OUT"):
+        headline = "Still on the ground — taxi is running longer than usual."
+        what = (taxi.get("summary")
+                or "You've left the gate, but the wait to take off is "
+                   "well past what's normal at this airport.")
+        # Rewrite taxi summary if it still sounds dispatcher-ish: the
+        # analyze_taxi summary is already plain English, so use it.
+        extras = ["Taxi is running long"]
+        if edct:
+            extras.append("FAA takeoff slot assigned")
+
+    elif phase_name == "AIRBORNE":
+        if arr_span:
+            headline = f"In the air — likely arriving about {arr_span} late."
+            what = ("It's airborne. The current arrival estimate is later "
+                    "than the schedule.")
+        else:
+            headline = "In the air — still expecting an on-time-ish arrival."
+            what = ("It's airborne and tracking toward the current arrival "
+                    "estimate. Nothing in the picture says that estimate "
+                    "is falling apart.")
+        extras = (["Running late into arrival"] if arr_span
+                  else ["Tracking toward the arrival estimate"])
+
+    elif edct or (late_span and (edct or inbound_tight or risk != "LOW")):
+        if late_span:
+            head = f"Likely {late_span} late{leaving}"
+        else:
+            head = f"Likely leaving later than scheduled{leaving}"
+        if _on_time_ish_arrival(arr_delay):
+            headline = f"{head}; still expect an on-time-ish arrival."
+        elif arr_span:
+            headline = f"{head}; arrival looking about {arr_span} late."
+        else:
+            headline = f"{head}."
+        reasons = []
+        if edct:
+            reasons.append("the FAA takeoff slot")
+        if inbound_tight:
+            reasons.append("the inbound aircraft")
+        if not reasons:
+            reasons.append("the current delay picture")
+        if len(reasons) == 1:
+            based = reasons[0]
+        else:
+            based = f"{reasons[0]} and {reasons[1]}"
+        what = (f"Based on {based}, the departure will wait for a specific "
+                "takeoff time rather than the published schedule.")
+        if _on_time_ish_arrival(arr_delay) and late_span:
+            what += " There's usually time to make up some of that in the air."
+
+    elif inbound_tight:
+        if late_span:
+            headline = (f"Likely {late_span} late{leaving} — the inbound "
+                        "plane is running tight.")
+        else:
+            headline = (f"The inbound plane is running tight"
+                        f"{' — expect a late push' + leaving if leaving else '.'}")
+        what = ("The plane for this flight is landing with less time to "
+                "turn around than it needs, so departure waits on it.")
+
+    elif _effect_mentions(effects, "ground stop") and dest:
+        dest_apt = traveler_airport(dest)
+        at = f" at {dest_apt}" if dest_apt else ""
+        headline = (f"Expect a hold leaving the gate — the arrival airport"
+                    f" has a ground stop{at}.")
+        what = ("Nothing can land at the destination right now, so flights "
+                "headed there are held on the ground until the stop lifts.")
+
+    elif risk in ("MODERATE", "HIGH"):
+        if late_span:
+            headline = f"Likely {late_span} late{leaving}."
+        else:
+            headline = ("This departure looks likely to be late"
+                        f"{leaving}." if leaving else
+                        "This departure looks likely to be late.")
+        what = ("Something in the current picture — weather, an airport "
+                "program, or the inbound plane — is enough to move this "
+                "flight. Treat the published time as a hope, not a plan.")
+
+    else:
+        # Clear LOW at a horizon that can actually support a call.
+        if next_label and next_local:
+            headline = (f"Looking on time — {next_label.lower()} around "
+                        f"{next_local}.")
+        else:
+            headline = ("Nothing worrying — still expect to leave close "
+                        "to schedule.")
+        what = ("Nothing in the current picture — schedule, weather, or "
+                "the inbound aircraft — points to a delay. That's a real "
+                "read at this range, not a guess from far out.")
+        extras = ["On schedule so far", "Nothing worrying yet"]
+
+    bullets = _basis_bullets(phase_name, too_early and not has_action,
+                             effects, extras)
+
+    return {
+        "headline": headline,
+        "what_i_think": what,
+        "confidence": confidence,
+        "risk": risk,
+        "next_event_label": next_label,
+        "next_event_local_display": next_local,
+        "basis_bullets": bullets,
+    }
+
+
+# ---------------------------------------------------------------------------
 # LLM prompt payload
 # ---------------------------------------------------------------------------
 

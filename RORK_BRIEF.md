@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.11","timestamp":"...",
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.12","timestamp":"...",
    "store":{...},"tracker_leader":true,"cache_entries":N,"breakers":{...},"swim_daemon":{...}}
 ```
 
@@ -467,6 +467,15 @@ aircraft pushes back. `hours_to_next_event` is the one that drives gating.
     "confidence_basis": "Horizon band NEXT_DAY — ...",
     "drivers": ["..."]
   },
+  "simple_summary": {
+    "headline": "Too early for a firm call — nothing worrying yet",
+    "what_i_think": "We're about 15 hours from departure. ...",
+    "confidence": "LOW",
+    "risk": "LOW",
+    "next_event_label": "Pushback",
+    "next_event_local_display": "7:41 PM EDT",
+    "basis_bullets": ["Too early to judge", "Nothing worrying yet"]
+  },
   "branch_classification": {
     "branch": "A" | "B" | "NOT_APPLICABLE" | "UNDETERMINED",
     "branch_label": "Transient — weather-driven, expected to clear",
@@ -506,7 +515,7 @@ attention (EDCT assigned, turn below minimum, ground stop at destination);
 encoded here — a GDP at the departure airport is INFO for a departure, ACTION
 territory only for flights arriving there.
 
-**`source` values you will see** (v1.11): `faa_status`, `swim_tfms`,
+**`source` values you will see** (v1.12): `faa_status`, `swim_tfms`,
 `equipment_chain`, `taf`, `taxi`, `position`, **`gairmet`**, **`atfm`**.
 `gairmet` is emitted only when `/api/brief` already consulted the G-AIRMET
 script (horizon ≤12h, not taxi-in) and `relevant[]` is non-empty. `atfm`
@@ -692,6 +701,54 @@ yet," not "this flight is fine."
 - `B` — structural. Equipment out of position, non-weather cause (staffing,
   volume, runway). Cascades forward regardless of weather improvement.
 - `NOT_APPLICABLE` — too far out for any mechanism to be assessable.
+
+### `simple_summary` (v1.12) — Simple mode, same product
+
+A deterministic, traveler-facing prediction block on **`/api/brief` and
+`/api/flight/live`**. Built in Python from fields already on the response
+(`verdict`, `effects`, `predicted_times`, `phase`, `taxi`,
+`branch_classification`, `horizon`). **No extra AeroAPI query, no LLM.**
+Pro fields are unchanged — Simple mode reads this object; Pro mode can
+ignore it.
+
+```json
+"simple_summary": {
+  "headline": "Likely 15–25 min late leaving JFK; still expect an on-time-ish arrival.",
+  "what_i_think": "Based on the FAA takeoff slot and the inbound aircraft, the departure will wait for a specific takeoff time rather than the published schedule. There's usually time to make up some of that in the air.",
+  "confidence": "MEDIUM",
+  "risk": "MODERATE",
+  "next_event_label": "Takeoff",
+  "next_event_local_display": "7:41 PM EDT",
+  "basis_bullets": ["FAA takeoff slot assigned", "Inbound plane running tight"]
+}
+```
+
+| Field | What it is |
+|---|---|
+| `headline` | One clear prediction. Render this first. |
+| `what_i_think` | One or two calm sentences of why. Jargon is expanded (`EDCT` → "FAA takeoff slot"). |
+| `confidence` | Same vocabulary as `verdict.confidence`: `LOW` / `MEDIUM` / `HIGH`. |
+| `risk` | Same vocabulary as `verdict.departure_risk`: `LOW` / `MODERATE` / `HIGH`. An assigned takeoff slot or a turn below minimum can lift this to `MODERATE` even if the coarse verdict stayed `LOW`. |
+| `next_event_label` / `next_event_local_display` | Copied from `phase` (`null` once the flight is cancelled or has no next event). |
+| `basis_bullets` | 1–4 short reasons, already traveler-safe. |
+
+**Horizon honesty.** When `horizon.band` is `NEXT_DAY` or `DISTANT`, or
+`branch` is `NOT_APPLICABLE`, and nothing ACTION-level is in play, the
+headline is *"Too early for a firm call — nothing worrying yet"* — not a
+fake-green "looking on time." A far-out TAF ACTION still says it's too
+early for a clock time, but names the weather as something to watch.
+
+**Closure.** Cancelled and arrived flights get a past-tense summary
+("This flight has been cancelled." / "This flight has arrived — on time.").
+
+The same object is copied into `llm_payload.facts.simple_summary` on
+`/api/brief` so a narrative can quote it. Simple mode does not need that
+call — render this JSON as-is.
+
+`/api/flight/live` includes the same shape. Its verdict is still
+`scope: "status_only"`, so the summary can only speak to what status (plus
+any cached EDCT / turn) already knows. Use `/api/brief` when Simple mode
+wants the full prediction.
 
 ### Cost
 

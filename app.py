@@ -938,7 +938,7 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.11",
+        "version": "1.12",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
@@ -1838,8 +1838,8 @@ def flight_live():
     AeroAPI status payload: 1 paid query, ~1-3s.
 
     Same field shapes as the brief envelope (phase, predicted_times, taxi,
-    verdict, refresh_after_seconds), so the client's existing decoders work
-    unchanged. The verdict is marked scope="status_only": no weather, FAA
+    verdict, simple_summary, refresh_after_seconds), so the client's existing
+    decoders work unchanged. The verdict is marked scope="status_only": no weather, FAA
     program, or equipment-chain sources are consulted at this price point —
     it can flag cancellations, diversions, slips, EDCTs, and taxi anomalies,
     but a LOW here is "nothing visible in status data," not "all clear".
@@ -1952,6 +1952,11 @@ def flight_live():
     _sev = {"ACTION": 0, "WATCH": 1, "INFO": 2}
     effects.sort(key=lambda e: _sev.get(e.get("severity"), 3))
 
+    simple_summary = analysis.build_simple_summary(
+        phase=phase, horizon=horizon, verdict=verdict, effects=effects,
+        predicted_times=predictions, taxi=taxi, branch=branch,
+        origin=origin, dest=dest)
+
     return jsonify({
         "flight": flight,
         "date": date,
@@ -1963,6 +1968,7 @@ def flight_live():
         "taxi": taxi,
         "horizon": horizon,
         "verdict": verdict,
+        "simple_summary": simple_summary,
         "effects": effects,
         "predicted_times": predictions,
         "timezones": {"origin": origin_tz, "destination": dest_tz},
@@ -2290,6 +2296,11 @@ def flight_brief():
     _sev = {"ACTION": 0, "WATCH": 1, "INFO": 2}
     effects.sort(key=lambda e: _sev.get(e.get("severity"), 3))
 
+    simple_summary = analysis.build_simple_summary(
+        phase=phase, horizon=horizon, verdict=verdict, effects=effects,
+        predicted_times=predictions, taxi=taxi, branch=branch,
+        origin=origin, dest=dest)
+
     excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
     if extended_weather is None and horizon.get("band") not in (
             "SAME_DAY", "NEXT_DAY", "DISTANT"):
@@ -2304,6 +2315,7 @@ def flight_brief():
     # rule to report rather than re-derive them.
     payload["facts"]["effects"] = effects
     payload["facts"]["predicted_times"] = predictions
+    payload["facts"]["simple_summary"] = simple_summary
     payload["facts"]["taf_windows"] = taf_windows
     payload["facts"]["phase"] = phase
     payload["facts"]["taxi"] = taxi
@@ -2348,6 +2360,7 @@ def flight_brief():
         "position": position,
         "horizon": horizon,
         "verdict": verdict,
+        "simple_summary": simple_summary,
         "effects": effects,
         "predicted_times": predictions,
         "taf_windows": taf_windows,

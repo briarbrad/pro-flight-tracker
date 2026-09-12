@@ -163,10 +163,15 @@ to 50; pass `limit=` (clamped 1–200) to raise it.
 
 ## Version history
 
-`/health` reports `"version": "1.11"`. Bump that string, this list, and
+`/health` reports `"version": "1.12"`. Bump that string, this list, and
 RORK_BRIEF.md together on every behavior change.
 
-- **v1.11** (current) — ATC flow brief + richer same-day nerd data:
+- **v1.12** (current) — Simple-mode `simple_summary` on `/api/brief` and
+  `/api/flight/live`. Deterministic, traveler-facing headline + why +
+  bullets built from existing brief fields (no extra AeroAPI, no LLM).
+  Too-early / `NOT_APPLICABLE` horizons refuse fake green certainty.
+  Pro fields are unchanged.
+- **v1.11** — ATC flow brief + richer same-day nerd data:
   - `GET /api/ops/flow-brief` — parallel TFMS-flow / TBFM / TFDM with
     bounded listen (4–12s), interpreted `advisories` / `metering` /
     `surface` / `effects`. Quiet or undeployed feeds are empty 200s.

@@ -92,7 +92,7 @@ Expected response:
 {
   "status": "ok",
   "service": "pro-flight-tracker",
-  "version": "1.11",
+  "version": "1.12",
   "timestamp": "2026-09-12T15:30:00Z",
   "store": {"backend": "postgres", "ok": true},
   "tracker_leader": true,
