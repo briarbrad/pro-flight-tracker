@@ -938,7 +938,7 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.12",
+        "version": "1.13",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
@@ -1838,8 +1838,10 @@ def flight_live():
     AeroAPI status payload: 1 paid query, ~1-3s.
 
     Same field shapes as the brief envelope (phase, predicted_times, taxi,
-    verdict, simple_summary, refresh_after_seconds), so the client's existing
-    decoders work unchanged. The verdict is marked scope="status_only": no weather, FAA
+    verdict, simple_summary, status, impactMinutes, causes, outlook,
+    refresh_after_seconds), so the client's existing decoders work unchanged.
+    `outlook.applicable` is always false here — this tile has no forecast
+    sources. The verdict is marked scope="status_only": no weather, FAA
     program, or equipment-chain sources are consulted at this price point —
     it can flag cancellations, diversions, slips, EDCTs, and taxi anomalies,
     but a LOW here is "nothing visible in status data," not "all clear".
@@ -1956,6 +1958,12 @@ def flight_live():
         phase=phase, horizon=horizon, verdict=verdict, effects=effects,
         predicted_times=predictions, taxi=taxi, branch=branch,
         origin=origin, dest=dest)
+    # Status-only tile: no TAF / Open-Meteo / TCF, so outlook is never a
+    # forecast. Client still receives the key with applicable: false.
+    presentation = analysis.build_presentation(
+        phase=phase, horizon=horizon, verdict=verdict, effects=effects,
+        predicted_times=predictions, taxi=taxi, branch=branch,
+        origin=origin, dest=dest, forecast_consulted=False)
 
     return jsonify({
         "flight": flight,
@@ -1969,6 +1977,10 @@ def flight_live():
         "horizon": horizon,
         "verdict": verdict,
         "simple_summary": simple_summary,
+        "status": presentation["status"],
+        "impactMinutes": presentation["impactMinutes"],
+        "causes": presentation["causes"],
+        "outlook": presentation["outlook"],
         "effects": effects,
         "predicted_times": predictions,
         "timezones": {"origin": origin_tz, "destination": dest_tz},
@@ -2300,6 +2312,17 @@ def flight_brief():
         phase=phase, horizon=horizon, verdict=verdict, effects=effects,
         predicted_times=predictions, taxi=taxi, branch=branch,
         origin=origin, dest=dest)
+    presentation = analysis.build_presentation(
+        phase=phase, horizon=horizon, verdict=verdict, effects=effects,
+        predicted_times=predictions, taxi=taxi, branch=branch,
+        origin=origin, dest=dest,
+        taf_windows=taf_windows,
+        extended_weather=extended_weather,
+        tcf=(sources.get("tcf") or {}).get("data"),
+        gairmet=(sources.get("gairmet") or {}).get("data"),
+        sigmet=(sources.get("sigmet") or {}).get("data"),
+        isigmet=(sources.get("isigmet") or {}).get("data"),
+        forecast_consulted=True)
 
     excluded = {k: v["reason"] for k, v in plan.items() if not v["relevant"]}
     if extended_weather is None and horizon.get("band") not in (
@@ -2316,6 +2339,10 @@ def flight_brief():
     payload["facts"]["effects"] = effects
     payload["facts"]["predicted_times"] = predictions
     payload["facts"]["simple_summary"] = simple_summary
+    payload["facts"]["status"] = presentation["status"]
+    payload["facts"]["impactMinutes"] = presentation["impactMinutes"]
+    payload["facts"]["causes"] = presentation["causes"]
+    payload["facts"]["outlook"] = presentation["outlook"]
     payload["facts"]["taf_windows"] = taf_windows
     payload["facts"]["phase"] = phase
     payload["facts"]["taxi"] = taxi
@@ -2361,6 +2388,10 @@ def flight_brief():
         "horizon": horizon,
         "verdict": verdict,
         "simple_summary": simple_summary,
+        "status": presentation["status"],
+        "impactMinutes": presentation["impactMinutes"],
+        "causes": presentation["causes"],
+        "outlook": presentation["outlook"],
         "effects": effects,
         "predicted_times": predictions,
         "taf_windows": taf_windows,

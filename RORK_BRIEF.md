@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.12","timestamp":"...",
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.13","timestamp":"...",
    "store":{...},"tracker_leader":true,"cache_entries":N,"breakers":{...},"swim_daemon":{...}}
 ```
 
@@ -476,6 +476,24 @@ aircraft pushes back. `hours_to_next_event` is the one that drives gating.
     "next_event_local_display": "7:41 PM EDT",
     "basis_bullets": ["Too early to judge", "Nothing worrying yet"]
   },
+  "status": {
+    "code": "UNKNOWN",
+    "label": "Too early to call",
+    "phase": "PRE_GATE"
+  },
+  "impactMinutes": null,
+  "causes": [],
+  "outlook": {
+    "applicable": true,
+    "riskLevel": "LOW",
+    "confidence": "LOW",
+    "headline": "Low delay risk on the forecast",
+    "causes": [
+      {"label": "Nothing worrying on the forecast",
+       "why": "No thunderstorms, low visibility, or winter weather...",
+       "severity": "INFO", "source": "taf"}
+    ]
+  },
   "branch_classification": {
     "branch": "A" | "B" | "NOT_APPLICABLE" | "UNDETERMINED",
     "branch_label": "Transient — weather-driven, expected to clear",
@@ -515,7 +533,7 @@ attention (EDCT assigned, turn below minimum, ground stop at destination);
 encoded here — a GDP at the departure airport is INFO for a departure, ACTION
 territory only for flights arriving there.
 
-**`source` values you will see** (v1.12): `faa_status`, `swim_tfms`,
+**`source` values you will see** (v1.13): `faa_status`, `swim_tfms`,
 `equipment_chain`, `taf`, `taxi`, `position`, **`gairmet`**, **`atfm`**.
 `gairmet` is emitted only when `/api/brief` already consulted the G-AIRMET
 script (horizon ≤12h, not taxi-in) and `relevant[]` is non-empty. `atfm`
@@ -702,7 +720,7 @@ yet," not "this flight is fine."
   volume, runway). Cascades forward regardless of weather improvement.
 - `NOT_APPLICABLE` — too far out for any mechanism to be assessable.
 
-### `simple_summary` (v1.12) — Simple mode, same product
+### `simple_summary` (v1.12, unchanged in v1.13) — Simple mode, same product
 
 A deterministic, traveler-facing prediction block on **`/api/brief` and
 `/api/flight/live`**. Built in Python from fields already on the response
@@ -749,6 +767,87 @@ call — render this JSON as-is.
 `scope: "status_only"`, so the summary can only speak to what status (plus
 any cached EDCT / turn) already knows. Use `/api/brief` when Simple mode
 wants the full prediction.
+
+### `status`, `impactMinutes`, `causes[]`, `outlook` (v1.13)
+
+A thin presentation layer on **`/api/brief` and `/api/flight/live`**. Built
+in Python from fields already on the response — `effects[]`, `verdict`,
+`predicted_times`, `phase`, `taxi`, EDCT, plus (brief only) `taf_windows`,
+`extended_weather`, G-AIRMET, TCF, SIGMET/ISIGMET. **No extra AeroAPI
+query, no LLM.** `simple_summary` stays the hero line; these blocks are
+the story the flight screen should tell instead of dumping feeds.
+
+**Client rule (one rule, stick to it):**
+
+| Show | When |
+|---|---|
+| `outlook` | `outlook.applicable === true` (far-out forecast) |
+| `status` + `impactMinutes` + `causes[]` | live / near — and always render `status` when a brief exists |
+| Both in the JSON | always, when a brief/live payload exists. They coexist. |
+
+`outlook` is **always present**. `applicable` is `true` only when **all** of:
+
+1. This is `/api/brief` (forecast sources were consulted). `/api/flight/live` is status-only and **always** returns `"outlook": {"applicable": false}` — do not treat a far-out live tile as a forecast.
+2. `phase.phase` is `PRE_GATE` (not taxiing, airborne, arrived, or cancelled).
+3. `horizon.band` is `NEXT_DAY` or `DISTANT`, **or** `branch_classification.branch` is `NOT_APPLICABLE`.
+
+Same-day / near / imminent / taxi / airborne / arrived keep live `status`
+in front. When `applicable` is false the object is just
+`{"applicable": false}` — no headline, no fake risk.
+
+```json
+"status": {
+  "code": "DELAYED",
+  "label": "Delayed 42m",
+  "phase": "PRE_GATE"
+},
+"impactMinutes": 42,
+"causes": [
+  {
+    "label": "GDP at JFK",
+    "why": "Arrival metering into the airport — may push your wheels-up",
+    "severity": "WATCH",
+    "source": "faa_status"
+  }
+]
+```
+
+| Field | What it is |
+|---|---|
+| `status.code` | `DELAYED` / `ON_TIME` / `EARLY` / `CANCELLED` / `ARRIVED` / `DIVERTED` / `UNKNOWN`. Far-out horizons are `UNKNOWN` ("Too early to call") — never a fake `ON_TIME`. |
+| `status.label` | Chip text: `"Delayed 42m"`, `"On time"`, `"Cancelled"`, `"Arrived on time"`, `"Too early to call"`. |
+| `status.phase` | Mirror of `phase.phase`. |
+| `impactMinutes` | Signed minutes vs schedule (takeoff/gate-out, or arrival once airborne). `null` when unknown, cancelled, or too early for a real reading. Positive = late. |
+| `causes[]` | Operational story, ordered ACTION → WATCH → INFO (same spirit as `effects[]`). `{label, why, severity, source}`. Reassuring INFO (VFR, "equipment is not a constraint") is omitted. When outlook is applicable, forecast-source rows (`taf`, `gairmet`, `tcf`, `sigmet`, `isigmet`, `extended_weather`) are **not** repeated here — they live on `outlook.causes` so they are not presented as a live delay. |
+
+```json
+"outlook": {
+  "applicable": true,
+  "riskLevel": "LOW" | "MODERATE" | "HIGH",
+  "confidence": "LOW" | "MEDIUM" | "HIGH",
+  "headline": "Elevated delay risk · weather",
+  "causes": [
+    {"label": "Thunderstorms around departure",
+     "why": "Thunderstorms in this window are the usual trigger for ground stops...",
+     "severity": "ACTION",
+     "source": "taf"}
+  ]
+}
+```
+
+Outlook **must feel like a forecast**, not a fake live delay. It extrapolates
+tomorrow from TAF windows, TCF, G-AIRMET, Open-Meteo `extended_weather`,
+and SIGMET/ISIGMET when those were already on the brief. Confidence is
+`LOW` at `DISTANT` and when the TAF does not cover the window; `MEDIUM`
+is the ceiling at `NEXT_DAY` with a covering TAF — outlook is never a
+high-confidence clock time.
+
+`source` values on `causes` / `outlook.causes` (v1.13): the `effects[]`
+set (`faa_status`, `swim_tfms`, `equipment_chain`, `taf`, `taxi`,
+`position`, `gairmet`, `atfm`) plus `tcf`, `sigmet`, `isigmet`,
+`extended_weather`.
+
+The same four keys are copied into `llm_payload.facts` on `/api/brief`.
 
 ### Cost
 
@@ -1332,3 +1431,7 @@ results[].effective_start / .effective_end
     metres or weather codes — that would contradict an official TAF.
 18. **`GET /api/ops/atfm` still costs AeroAPI.** The same heuristic is
     already on `/api/brief` and `/api/flight/live` for free. Prefer those.
+19. **`outlook.applicable` is the only switch.** Do not infer a forecast
+    from a far-out `/api/flight/live` tile — that endpoint never consults
+    TAF/Open-Meteo and always returns `applicable: false`. Far-out
+    `status.code` is `UNKNOWN`, not `ON_TIME`.

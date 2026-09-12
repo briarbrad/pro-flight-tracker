@@ -22,6 +22,7 @@ anything.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2512,3 +2513,720 @@ def atfm_effects(atfm: dict) -> list:
         "severity": severity,
         "source": "atfm",
     }]
+
+
+# ---------------------------------------------------------------------------
+# Presentation layer — traveler-facing status / causes / outlook
+#
+# Thin reshape of fields the brief (and the cheap live tile) already compute.
+# No extra AeroAPI, no LLM. simple_summary stays the hero line; these blocks
+# give the client a story (what is happening, why, and — far out — a forecast)
+# instead of dumping raw feeds.
+# ---------------------------------------------------------------------------
+
+_SEV_ORDER = {"ACTION": 0, "WATCH": 1, "INFO": 2}
+_FORECAST_SOURCES = frozenset({
+    "taf", "gairmet", "tcf", "sigmet", "isigmet", "extended_weather",
+})
+_ON_TIME_SLOP_MIN = 5
+_AT_AIRPORT = re.compile(r"\bat\s+([A-Z]{3,4})\b", re.I)
+_SKIP_AIRPORT_TOKENS = frozenset({
+    "THE", "AND", "FOR", "NOT", "THIS", "THAT", "FROM", "WITH",
+    "VFR", "IFR", "MVFR", "LIFR", "TEMPO", "PROB", "EDCT", "ATFM",
+    "CTOT", "TFMS", "TAF", "GDP", "INFO", "WATCH",
+})
+
+
+def sort_by_severity(items: list) -> list:
+    """ACTION → WATCH → INFO. Unknown severity sorts last. Stable."""
+    return sorted(
+        items or [],
+        key=lambda e: _SEV_ORDER.get((e or {}).get("severity"), 3),
+    )
+
+
+def _as_int_minutes(value):
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_minutes(value) -> str:
+    n = _as_int_minutes(value)
+    if n is None:
+        return ""
+    return f"{abs(n)}m"
+
+
+def _airport_token(text: str, fallback: str = "") -> str:
+    """Pull a traveler airport (JFK, LHR) out of 'GDP at KJFK' prose."""
+    for match in _AT_AIRPORT.finditer(text or ""):
+        token = (match.group(1) or "").upper()
+        if token in _SKIP_AIRPORT_TOKENS:
+            continue
+        return traveler_airport(token)
+    return traveler_airport(fallback)
+
+
+def _first_sentence(text: str) -> str:
+    blob = (text or "").strip()
+    if not blob:
+        return ""
+    cut = blob.find(". ")
+    return blob[:cut + 1] if cut > 0 else blob
+
+
+def _is_reassuring_info(effect: dict) -> bool:
+    """INFO rows that are 'all clear' — not a cause the traveler needs."""
+    if (effect or {}).get("severity") != "INFO":
+        return False
+    blob = " ".join((
+        str(effect.get("cause") or ""),
+        str(effect.get("effect") or ""),
+    )).lower()
+    if "vfr through" in blob or "not expected to constrain" in blob:
+        return True
+    if "equipment is not a constraint" in blob:
+        return True
+    if "not a constraint" in blob and "equipment" in blob:
+        return True
+    if "no strong evidence" in blob:
+        return True
+    return False
+
+
+def _short_cause_label(effect: dict, origin: str = None,
+                       dest: str = None) -> str:
+    src = (effect.get("source") or "").lower()
+    cause = effect.get("cause") or ""
+    blob = (cause + " " + (effect.get("effect") or "")).lower()
+    apt = _airport_token(cause, "")
+
+    if src == "swim_tfms" or "edct" in blob:
+        return "FAA takeoff slot"
+    if src == "equipment_chain":
+        if effect.get("severity") == "ACTION":
+            return "Inbound plane tight"
+        if effect.get("severity") == "WATCH":
+            return "Inbound turn is tight"
+        return "Inbound aircraft"
+    if src == "taxi":
+        return "Long taxi" if effect.get("severity") == "ACTION" else "Taxi running long"
+    if src == "faa_status":
+        where = f" at {apt}" if apt else ""
+        if "ground stop" in blob:
+            return f"Ground stop{where}"
+        if "ground delay program" in blob or "gdp" in blob:
+            return f"GDP{where}"
+        if "closure" in blob:
+            return f"Airport closure{where}"
+        if "general delays" in blob or "arr_dep" in blob:
+            return f"Airport delays{where}"
+        return f"Airport program{where}" if where else "Airport program"
+    if src == "taf":
+        role = ("arrival" if "arriv" in blob
+                else "departure" if ("depart" in blob or "origin" in blob
+                                     or "takeoff" in blob)
+                else "")
+        at = f" at {apt}" if apt else (f" around {role}" if role else "")
+        if "thunderstorm" in blob:
+            return f"Thunderstorms{at}"
+        if "freezing" in blob or "snow" in blob or "ice pellet" in blob:
+            return f"Winter weather{at}"
+        if "lifr" in blob or "ifr" in blob:
+            return f"Low visibility{at}"
+        if "gust" in blob:
+            return f"Strong gusts{at}"
+        if "shear" in blob:
+            return f"Wind shear{at}"
+        if "tempo" in blob or "prob" in blob:
+            return f"Temporary weather{at}"
+        if "mvfr" in blob:
+            return f"Marginal weather{at}"
+        return f"Weather{at}" if at else "Weather in the window"
+    if src == "atfm":
+        where = f" at {apt}" if apt else ""
+        return f"European takeoff slot{where}"
+    if src == "gairmet":
+        if "llws" in blob or "shear" in blob:
+            return "Wind shear on the route"
+        if "ice" in blob:
+            return "Icing on the route"
+        return "Turbulence on the route"
+    if src == "position":
+        return "Aircraft holding on the ground"
+    if src == "tcf":
+        return "Thunderstorms on the forecast"
+    if src in ("sigmet", "isigmet"):
+        if "convective" in blob or "thunderstorm" in blob:
+            return "Convective SIGMET"
+        if "ice" in blob:
+            return "Icing SIGMET"
+        return "SIGMET on the route"
+    if src == "extended_weather":
+        if "rain" in blob or "precip" in blob:
+            return f"Rain likely at {apt}" if apt else "Rain likely"
+        if "gust" in blob:
+            return f"Strong gusts at {apt}" if apt else "Strong gusts"
+        if "visib" in blob:
+            return f"Reduced visibility at {apt}" if apt else "Reduced visibility"
+        return "Model weather guidance"
+    # Fall back to a clipped cause, never an empty label.
+    clipped = cause.strip()
+    if len(clipped) > 48:
+        clipped = clipped[:45].rstrip() + "…"
+    return clipped or "Something to watch"
+
+
+def _why_from_effect(effect: dict) -> str:
+    """One traveler-facing sentence. Prefer a short rewrite over jargon."""
+    src = (effect.get("source") or "").lower()
+    cause = (effect.get("cause") or "").lower()
+    effect_txt = effect.get("effect") or ""
+    blob = cause + " " + effect_txt.lower()
+
+    if src == "swim_tfms" or "edct" in cause:
+        return ("The FAA assigned a takeoff time — expect to wait for that "
+                "slot, not the published schedule.")
+    if src == "equipment_chain":
+        if effect.get("severity") == "ACTION":
+            return ("The inbound plane lands with less turn time than it "
+                    "needs, so this departure waits on it.")
+        if effect.get("severity") == "WATCH":
+            return ("The inbound turn is tight — any further slip transfers "
+                    "straight to this departure.")
+        return _first_sentence(effect_txt) or effect_txt
+    if src == "taxi":
+        return _first_sentence(effect_txt) or effect_txt
+    if src == "faa_status":
+        if "ground delay program" in blob or "gdp" in blob:
+            if "arriving into the origin" in blob or "meters flights arriving" in blob:
+                return ("Arrival metering into the airport — may push your "
+                        "wheels-up")
+            if "subject to the program" in blob:
+                return ("This flight may get an FAA takeoff slot — the "
+                        "schedule is no longer the plan.")
+            return "A delay program is metering traffic at this airport."
+        if "ground stop" in blob:
+            if "held on the ground" in blob or "bound for the destination" in blob:
+                return ("Nothing can land there right now, so this departure "
+                        "waits.")
+            return ("Inbound traffic is stopped — expect congestion and late "
+                    "aircraft.")
+        if "closure" in blob:
+            return "Reduced capacity at the airport — expect knock-on delays."
+        return _first_sentence(effect_txt) or effect_txt
+    if src == "taf":
+        if "thunderstorm" in blob:
+            return ("Thunderstorms in this window are the usual trigger for "
+                    "ground stops and ramp closures. This is a forecast, "
+                    "not a delay assignment yet.")
+        if "freezing" in blob or "snow" in blob:
+            return ("Winter weather in the window usually means de-icing and "
+                    "slower airport rates. Forecast, not a live hold.")
+        if "lifr" in blob or ("ifr" in blob and "mvfr" not in cause):
+            return ("Low visibility slows departures and arrivals. Worth "
+                    "watching as the forecast firms up.")
+        return _first_sentence(effect_txt) or effect_txt
+    if src == "atfm":
+        return ("Delay pattern is consistent with a European takeoff slot. "
+                "Heuristic — not a published assignment.")
+    if src == "gairmet":
+        return _first_sentence(effect_txt) or effect_txt
+    if src == "position":
+        return ("The aircraft is sitting still on the airport surface, "
+                "usually in a queue or waiting for a release.")
+    return _first_sentence(effect_txt) or effect_txt or cause
+
+
+def _cause_from_effect(effect: dict, origin: str = None,
+                       dest: str = None) -> dict | None:
+    if not isinstance(effect, dict):
+        return None
+    if _is_reassuring_info(effect):
+        return None
+    label = _short_cause_label(effect, origin, dest)
+    why = _why_from_effect(effect)
+    if not label or not why:
+        return None
+    sev = effect.get("severity") or "INFO"
+    if sev not in _SEV_ORDER:
+        sev = "INFO"
+    return {
+        "label": label,
+        "why": why,
+        "severity": sev,
+        "source": effect.get("source") or "unknown",
+    }
+
+
+def _impact_minutes(phase_name: str, predicted_times: dict,
+                    too_early: bool, has_action: bool):
+    """Signed minutes vs schedule. None when unknown or not a real reading."""
+    if phase_name == "CANCELLED":
+        return None
+    # Scheduled 0 at a far-out horizon is not a measured delay.
+    if too_early and not has_action:
+        return None
+    if phase_name in ("ARRIVED", "TAXI_IN", "AIRBORNE"):
+        return _as_int_minutes(
+            _pred_delay(predicted_times, "gate_arrival", "takeoff"))
+    return _as_int_minutes(
+        _pred_delay(predicted_times, "takeoff", "gate_departure"))
+
+
+def _operational_action(effects: list) -> list:
+    """ACTION that is happening to THIS flight, not a forecast watch."""
+    return [e for e in _action_effects(effects)
+            if (e.get("source") or "") not in _FORECAST_SOURCES]
+
+
+def build_status(phase: dict = None, horizon: dict = None,
+                 predicted_times: dict = None, effects: list = None,
+                 branch: dict = None, impact_minutes=None) -> dict:
+    """Operational status chip. Never a fake on-time call far out."""
+    phase = phase or {}
+    horizon = horizon or {}
+    predicted_times = predicted_times or {}
+    effects = effects or []
+    branch = branch or {}
+
+    phase_name = phase.get("phase") or horizon.get("phase") or ""
+    too_early = _too_early(horizon, branch)
+    has_action = bool(_action_effects(effects))
+    live_action = bool(_operational_action(effects))
+    if impact_minutes is None:
+        impact_minutes = _impact_minutes(phase_name, predicted_times,
+                                         too_early, has_action)
+
+    if phase_name == "CANCELLED":
+        code, label = "CANCELLED", "Cancelled"
+    elif phase.get("diverted") and phase_name != "ARRIVED":
+        code, label = "DIVERTED", "Diverted"
+    elif phase_name == "ARRIVED":
+        code = "ARRIVED"
+        mins = _as_int_minutes(
+            _pred_delay(predicted_times, "gate_arrival"))
+        if mins is None or abs(mins) < _ON_TIME_SLOP_MIN:
+            label = "Arrived on time"
+        elif mins > 0:
+            label = f"Arrived {_fmt_minutes(mins)} late"
+        else:
+            label = f"Arrived {_fmt_minutes(mins)} early"
+    elif too_early:
+        # Forecast ACTION is not a live delay. Outlook tells that story.
+        code, label = "UNKNOWN", "Too early to call"
+    elif impact_minutes is not None and impact_minutes >= _ON_TIME_SLOP_MIN:
+        code, label = "DELAYED", f"Delayed {_fmt_minutes(impact_minutes)}"
+    elif impact_minutes is not None and impact_minutes <= -_ON_TIME_SLOP_MIN:
+        code, label = "EARLY", f"Early {_fmt_minutes(impact_minutes)}"
+    elif live_action:
+        # Ground stop / EDCT / tight inbound with no clock slip yet.
+        if impact_minutes is not None and impact_minutes >= 1:
+            code, label = "DELAYED", f"Delayed {_fmt_minutes(impact_minutes)}"
+        else:
+            code, label = "DELAYED", "Delayed"
+    elif impact_minutes is None:
+        code, label = "UNKNOWN", "Unknown"
+    else:
+        code, label = "ON_TIME", "On time"
+
+    return {
+        "code": code,
+        "label": label,
+        "phase": phase_name or None,
+    }
+
+
+def outlook_applicable(phase: dict = None, horizon: dict = None,
+                       branch: dict = None,
+                       forecast_consulted: bool = False) -> bool:
+    """Show outlook when the flight is still at the gate and far out.
+
+    Documented rule (stick to it):
+      applicable is true only when ALL of:
+        1. forecast_consulted — `/api/brief` consulted forecast sources
+           (TAF / Open-Meteo / etc.). `/api/flight/live` is status-only
+           and always passes False, so outlook is never a fake forecast.
+        2. phase is PRE_GATE (not taxiing, airborne, arrived, cancelled)
+        3. horizon.band is NEXT_DAY or DISTANT, OR branch is NOT_APPLICABLE
+
+    SAME_DAY / NEAR / IMMINENT keep live status + impactMinutes in front.
+    Both blocks can still coexist in the JSON; the client shows outlook
+    when applicable and the horizon is far, and status when live/near.
+    """
+    if not forecast_consulted:
+        return False
+    phase = phase or {}
+    horizon = horizon or {}
+    branch = branch or {}
+    phase_name = phase.get("phase") or horizon.get("phase") or ""
+    if phase_name != "PRE_GATE":
+        return False
+    if phase.get("is_terminal") or phase_name in ("ARRIVED", "CANCELLED"):
+        return False
+    if horizon.get("band") in ("NEXT_DAY", "DISTANT"):
+        return True
+    return branch.get("branch") == "NOT_APPLICABLE"
+
+
+def _unwrap_route_payload(payload):
+    """Accept a raw ops payload or an Envelope-wrapped one."""
+    if not isinstance(payload, dict):
+        return payload
+    if isinstance(payload.get("relevant"), list):
+        return payload
+    inner = payload.get("data")
+    if isinstance(inner, dict) and isinstance(inner.get("relevant"), list):
+        return inner
+    return payload
+
+
+def _outlook_from_extended_weather(extended_weather: dict) -> list:
+    """Model guidance → forecast causes. Never invents VFR/IFR."""
+    if not isinstance(extended_weather, dict):
+        return []
+    airports = extended_weather.get("airports")
+    if not isinstance(airports, dict):
+        inner = extended_weather.get("data")
+        airports = inner if isinstance(inner, dict) else {}
+    causes = []
+    for icao, block in airports.items():
+        if not isinstance(block, dict):
+            continue
+        apt = traveler_airport(block.get("icao") or icao)
+        nxt = block.get("next_6h") or {}
+        precip = nxt.get("max_precip_probability_pct")
+        gust = nxt.get("max_wind_gust_kts")
+        vis = nxt.get("min_visibility_m")
+        if isinstance(precip, (int, float)) and precip >= 60:
+            causes.append({
+                "label": f"Rain likely at {apt}" if apt else "Rain likely",
+                "why": (
+                    f"Model guidance shows about {int(precip)}% chance of "
+                    f"precipitation near {apt or 'the airport'}. This is "
+                    "not a TAF — an early signal, not a delay assignment."
+                ),
+                "severity": "WATCH" if precip >= 70 else "INFO",
+                "source": "extended_weather",
+            })
+        if isinstance(gust, (int, float)) and gust >= 30:
+            causes.append({
+                "label": f"Strong gusts at {apt}" if apt else "Strong gusts",
+                "why": (
+                    f"Model guidance has gusts to {int(gust)} kt near "
+                    f"{apt or 'the airport'}. Strong gusts can slow the "
+                    "airport; this is not an official forecast category."
+                ),
+                "severity": "WATCH",
+                "source": "extended_weather",
+            })
+        if isinstance(vis, (int, float)) and vis < 5000:
+            causes.append({
+                "label": (f"Reduced visibility at {apt}" if apt
+                          else "Reduced visibility"),
+                "why": (
+                    f"Model guidance dips toward {int(vis)} m visibility "
+                    f"near {apt or 'the airport'}. Not a flight category "
+                    "— re-check the TAF when it covers the window."
+                ),
+                "severity": "WATCH",
+                "source": "extended_weather",
+            })
+    return causes
+
+
+def _outlook_from_tcf(tcf: dict) -> list:
+    payload = _unwrap_route_payload(tcf)
+    if not isinstance(payload, dict):
+        return []
+    relevant = payload.get("relevant")
+    if not isinstance(relevant, list) or not relevant:
+        return []
+    causes = []
+    for hit in relevant:
+        if not isinstance(hit, dict):
+            continue
+        coverage = (hit.get("coverage") or "").lower()
+        where_bits = []
+        if hit.get("near_origin"):
+            where_bits.append("near departure")
+        if hit.get("near_dest"):
+            where_bits.append("near arrival")
+        if hit.get("along_route"):
+            where_bits.append("along the route")
+        where = ", ".join(where_bits) or "along the route"
+        sev = "WATCH" if coverage == "medium" else "INFO"
+        causes.append({
+            "label": "Thunderstorms on the forecast",
+            "why": (
+                f"Convective forecast ({coverage or 'unspecified'} coverage) "
+                f"{where}. This is the product traffic management uses to "
+                "call ground stops — still a forecast, not a hold on this "
+                "flight."
+            ),
+            "severity": sev,
+            "source": "tcf",
+        })
+        if len(causes) >= 2:
+            break
+    return causes
+
+
+def _outlook_from_sigmets(payload, source: str) -> list:
+    if not payload:
+        return []
+    items = payload
+    if isinstance(payload, dict):
+        items = payload.get("data") if isinstance(payload.get("data"), list) \
+            else payload.get("results") or []
+    if not isinstance(items, list):
+        return []
+    causes = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        haz = (item.get("hazard") or "").upper()
+        if not haz:
+            continue
+        if haz == "CONVECTIVE" or "TS" in haz:
+            label = "Convective SIGMET"
+            why = ("Severe thunderstorms are advertised now. This product "
+                   "expires today — a weather-pattern signal, not tomorrow's "
+                   "delay assignment.")
+            sev = "WATCH"
+        elif "ICE" in haz:
+            label = "Icing SIGMET"
+            why = ("Icing is advertised on the route. Ride-quality / altitude "
+                   "changes more than a gate hold. Current product, not a "
+                   "tomorrow assignment.")
+            sev = "INFO"
+        elif "TURB" in haz:
+            label = "Turbulence SIGMET"
+            why = ("Turbulence is advertised on the route. Usually a rougher "
+                   "ride, not a departure delay. Current product, not a "
+                   "tomorrow assignment.")
+            sev = "INFO"
+        else:
+            label = f"{haz} SIGMET"
+            why = ("A SIGMET is active. Current product — it will expire "
+                   "before a far-out departure.")
+            sev = "INFO"
+        causes.append({
+            "label": label, "why": why, "severity": sev, "source": source,
+        })
+        if len(causes) >= 3:
+            break
+    return causes
+
+
+def _outlook_confidence(horizon: dict, taf_windows: dict) -> str:
+    """Forecast confidence. Never HIGH — outlook is not live status."""
+    band = (horizon or {}).get("band")
+    if band == "DISTANT":
+        return "LOW"
+    taf_covers = False
+    for taf in (taf_windows or {}).values():
+        if isinstance(taf, dict) and taf.get("available"):
+            taf_covers = True
+            break
+    if band == "NEXT_DAY" and taf_covers:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _outlook_risk(causes: list) -> str:
+    actions = [c for c in causes if c.get("severity") == "ACTION"]
+    watches = [c for c in causes if c.get("severity") == "WATCH"]
+    if len(actions) >= 2:
+        return "HIGH"
+    if actions:
+        blob = " ".join(
+            f"{c.get('label', '')} {c.get('why', '')}" for c in actions
+        ).lower()
+        severe = ("thunderstorm" in blob and
+                  ("visibility" in blob or "ifr" in blob or "low vis" in blob
+                   or "winter" in blob or "freezing" in blob))
+        return "HIGH" if severe else "MODERATE"
+    if watches:
+        return "MODERATE"
+    return "LOW"
+
+
+def _outlook_headline(risk: str, causes: list) -> str:
+    blob = " ".join(
+        f"{c.get('label', '')} {c.get('why', '')}" for c in causes
+    ).lower()
+    if risk == "LOW":
+        return "Low delay risk on the forecast"
+    if "thunderstorm" in blob:
+        weather = "thunderstorms"
+    elif "winter" in blob or "freezing" in blob or "snow" in blob:
+        weather = "winter weather"
+    elif "visibility" in blob or "ifr" in blob:
+        weather = "low visibility"
+    elif "rain" in blob or "precip" in blob:
+        weather = "rain"
+    else:
+        weather = "weather"
+    if risk == "HIGH":
+        return f"High delay risk · {weather}"
+    return f"Elevated delay risk · {weather}"
+
+
+def build_outlook(phase: dict = None, horizon: dict = None,
+                  branch: dict = None, effects: list = None,
+                  taf_windows: dict = None, extended_weather: dict = None,
+                  tcf: dict = None, gairmet: dict = None,
+                  sigmet=None, isigmet=None,
+                  forecast_consulted: bool = False,
+                  origin: str = None, dest: str = None) -> dict:
+    """Far-out forecast block. Feels like a forecast, never a fake delay."""
+    if not outlook_applicable(phase, horizon, branch,
+                              forecast_consulted=forecast_consulted):
+        return {"applicable": False}
+
+    causes = []
+    seen = set()
+
+    def _add(items):
+        for raw in items or []:
+            cause = raw if (
+                isinstance(raw, dict) and "label" in raw and "why" in raw
+            ) else _cause_from_effect(raw, origin, dest)
+            if not cause:
+                continue
+            key = (cause["label"], cause["source"])
+            if key in seen:
+                continue
+            seen.add(key)
+            causes.append(cause)
+
+    # Forecast-flavoured effects already on the brief (TAF, G-AIRMET).
+    _add([e for e in (effects or [])
+          if (e or {}).get("source") in _FORECAST_SOURCES])
+
+    # If the caller passed windows but no TAF effects, derive them.
+    if taf_windows and not any(c.get("source") == "taf" for c in causes):
+        for role, taf in taf_windows.items():
+            if isinstance(taf, dict):
+                _add(taf_effects(taf, role if role in ("departure", "arrival")
+                                 else "departure"))
+
+    if gairmet and not any(c.get("source") == "gairmet" for c in causes):
+        payload = _unwrap_route_payload(gairmet)
+        if isinstance(payload, dict):
+            _add(gairmet_effects(payload))
+
+    _add(_outlook_from_extended_weather(extended_weather))
+    _add(_outlook_from_tcf(tcf))
+    _add(_outlook_from_sigmets(sigmet, "sigmet"))
+    _add(_outlook_from_sigmets(isigmet, "isigmet"))
+
+    causes = sort_by_severity(causes)
+    risk = _outlook_risk(causes)
+    confidence = _outlook_confidence(horizon, taf_windows)
+
+    # Empty + LOW still needs a traveler sentence so the client isn't blank.
+    if not causes and risk == "LOW":
+        src = "taf" if any(
+            isinstance(t, dict) and t.get("available")
+            for t in (taf_windows or {}).values()
+        ) else ("extended_weather" if extended_weather else "taf")
+        causes.append({
+            "label": "Nothing worrying on the forecast",
+            "why": ("No thunderstorms, low visibility, or winter weather in "
+                    "the window we can see. That is not a promise of an "
+                    "on-time departure — programs and the inbound aircraft "
+                    "are not assigned yet."),
+            "severity": "INFO",
+            "source": src,
+        })
+
+    return {
+        "applicable": True,
+        "riskLevel": risk,
+        "confidence": confidence,
+        "headline": _outlook_headline(risk, causes),
+        "causes": causes,
+    }
+
+
+def build_causes(effects: list = None, origin: str = None, dest: str = None,
+                 hide_forecast: bool = False) -> list:
+    """Operational causes for the live/near story. ACTION → WATCH → INFO.
+
+    When `hide_forecast` is true (outlook is applicable), TAF / G-AIRMET /
+    TCF / SIGMET rows stay on `outlook.causes` so they are not presented
+    as a live delay.
+    """
+    causes = []
+    for effect in effects or []:
+        if hide_forecast and (effect or {}).get("source") in _FORECAST_SOURCES:
+            continue
+        cause = _cause_from_effect(effect, origin, dest)
+        if cause:
+            causes.append(cause)
+    return sort_by_severity(causes)
+
+
+def build_presentation(phase: dict = None, horizon: dict = None,
+                       verdict: dict = None, effects: list = None,
+                       predicted_times: dict = None, taxi: dict = None,
+                       branch: dict = None, origin: str = None,
+                       dest: str = None, taf_windows: dict = None,
+                       extended_weather: dict = None, tcf: dict = None,
+                       gairmet: dict = None, sigmet=None, isigmet=None,
+                       forecast_consulted: bool = False) -> dict:
+    """Assemble status + impactMinutes + causes + outlook.
+
+    `forecast_consulted=True` only on `/api/brief`, where TAF / Open-Meteo
+    / etc. were actually considered. `/api/flight/live` leaves it False.
+    """
+    phase = phase or {}
+    horizon = horizon or {}
+    effects = effects or []
+    predicted_times = predicted_times or {}
+    branch = branch or {}
+
+    taxi = taxi or {}
+    phase_name = phase.get("phase") or horizon.get("phase") or ""
+    too_early = _too_early(horizon, branch)
+    has_action = bool(_action_effects(effects))
+    impact = _impact_minutes(phase_name, predicted_times, too_early,
+                             has_action)
+    # An extended taxi-out is a delay that is already happening.
+    if (not too_early and taxi.get("applicable")
+            and taxi.get("assessment") == "EXTENDED"
+            and taxi.get("phase") == "TAXI_OUT"):
+        excess = _as_int_minutes(taxi.get("excess_vs_typical_min"))
+        if excess and (impact is None or impact < excess):
+            impact = excess
+    # Far-out TAF ACTION must not mint a live delay figure from schedule=0
+    # or from a forecast-only effect.
+    if too_early:
+        impact = None
+
+    applicable = outlook_applicable(phase, horizon, branch,
+                                    forecast_consulted=forecast_consulted)
+    status = build_status(phase=phase, horizon=horizon,
+                          predicted_times=predicted_times, effects=effects,
+                          branch=branch, impact_minutes=impact)
+    causes = build_causes(effects, origin=origin, dest=dest,
+                          hide_forecast=applicable)
+    outlook = build_outlook(
+        phase=phase, horizon=horizon, branch=branch, effects=effects,
+        taf_windows=taf_windows, extended_weather=extended_weather,
+        tcf=tcf, gairmet=gairmet, sigmet=sigmet, isigmet=isigmet,
+        forecast_consulted=forecast_consulted,
+        origin=origin, dest=dest,
+    )
+    return {
+        "status": status,
+        "impactMinutes": impact,
+        "causes": causes,
+        "outlook": outlook,
+    }

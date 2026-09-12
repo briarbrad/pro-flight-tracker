@@ -163,10 +163,16 @@ to 50; pass `limit=` (clamped 1–200) to raise it.
 
 ## Version history
 
-`/health` reports `"version": "1.12"`. Bump that string, this list, and
+`/health` reports `"version": "1.13"`. Bump that string, this list, and
 RORK_BRIEF.md together on every behavior change.
 
-- **v1.12** (current) — Simple-mode `simple_summary` on `/api/brief` and
+- **v1.13** (current) — Presentation layer on `/api/brief` and
+  `/api/flight/live`: `status`, `impactMinutes`, `causes[]`, and
+  `outlook`. `simple_summary` stays the hero line. Outlook is a
+  forecast (far-out / `NOT_APPLICABLE` only, and only when `/api/brief`
+  actually consulted forecast sources) — never a fake live delay. No
+  extra AeroAPI.
+- **v1.12** — Simple-mode `simple_summary` on `/api/brief` and
   `/api/flight/live`. Deterministic, traveler-facing headline + why +
   bullets built from existing brief fields (no extra AeroAPI, no LLM).
   Too-early / `NOT_APPLICABLE` horizons refuse fake green certainty.
