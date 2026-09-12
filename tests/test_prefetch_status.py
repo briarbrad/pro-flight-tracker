@@ -64,12 +64,15 @@ def test_prefetched_flights_junk_raw_returns_none():
     assert flight_data._prefetched_flights("DL244", raw="[]") is None
 
 
-def test_status_prefetch_env_builds_json_for_usable_envelope():
+def test_status_prefetch_env_carries_dict_for_usable_envelope():
+    # In-process path: the dict itself, no JSON round-trip. The subprocess
+    # env serialization (bounded) is covered in test_prefetch.py.
     env = _status_prefetch_env(_status_payload())
     assert env is not None
-    parsed = json.loads(env["PFT_PREFETCHED_STATUS"])
-    assert parsed["flight"] == "DL244"
-    assert parsed["data"]["flights"]
+    payload = env["PFT_PREFETCHED_STATUS"]
+    assert isinstance(payload, dict)
+    assert payload["flight"] == "DL244"
+    assert payload["data"]["flights"]
 
 
 def test_status_prefetch_env_rejects_errors_and_empty():
