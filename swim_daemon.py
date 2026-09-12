@@ -66,6 +66,14 @@ _BACKOFF_MAX = 300
 _threads: list = []
 _stop = threading.Event()
 
+import collections
+
+_STDERR_RING_MAX = 200
+_stderr_rings: dict = {}  # queue_name -> deque[str], last N stderr lines
+_stderr_lock = threading.Lock()
+_child_procs: list = []   # live JVM consumer handles, so stop() can kill them
+_proc_lock = threading.Lock()
+
 
 class _StreamParser:
     """Incremental version of swim_consumer.parse_raw_output.
@@ -129,6 +137,44 @@ def _log(msg: str) -> None:
     print(f"[SWIM-DAEMON] {msg}", file=sys.stderr, flush=True)
 
 
+def _pump_stderr(queue_name: str, pipe) -> None:
+    """Drain a consumer's stderr into a bounded ring buffer.
+
+    DEVNULL used to swallow everything — including the JVM's reason for
+    dying. The ring keeps the last 200 lines; on an unexpected death the
+    watchdog surfaces fatal markers from it.
+    """
+    ring = collections.deque(maxlen=_STDERR_RING_MAX)
+    with _stderr_lock:
+        _stderr_rings[queue_name] = ring
+    try:
+        for raw in pipe:
+            ring.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _fatal_stderr_line(queue_name: str) -> str:
+    """First ring-buffer line matching a known JVM fatal marker, or ''."""
+    with _stderr_lock:
+        lines = list(_stderr_rings.get(queue_name, ()))
+    for line in lines:
+        if any(m in line for m in sc.FATAL_STDERR_MARKERS):
+            return line.strip()
+    return ""
+
+
+def _stderr_tail(queue_name: str, n: int = 5) -> str:
+    with _stderr_lock:
+        lines = list(_stderr_rings.get(queue_name, ()))
+    return " | ".join(l.strip() for l in lines[-n:] if l.strip())
+
+
 def _iata_ident_from_callsign(callsign: str) -> str:
     """DAL5187 -> DL5187. Unknown prefixes pass through unchanged."""
     cs = (callsign or "").upper().replace(" ", "")
@@ -159,8 +205,11 @@ def _store_edcts(records: list) -> int:
         try:
             store.cache_edct(ident, date, edct)
             stored += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            # cache_edct is best-effort and logs its own failures; this is
+            # a last-resort guard so one bad EDCT can't kill the daemon.
+            _log(f"cache_edct raised for {ident}: "
+                 f"{type(exc).__name__}: {exc}")
     return stored
 
 
@@ -177,18 +226,25 @@ def _handle_message(queue_name: str, msg: tuple) -> int:
             continue
         if not records:
             continue
-        try:
-            store.swim_record_events(feed_name, records)
-        except Exception:
-            pass
+        if not store.swim_record_events(feed_name, records):
+            # Store logs the Postgres failure itself; note here that the
+            # daemon's events are degraded to per-worker memory.
+            _log(f"{queue_name}/{feed_name}: events fell back to "
+                 f"per-worker memory")
         if feed_name == "tfms-flight":
             _store_edcts(records)
         total += len(records)
     return total
 
 
-def _spawn_consumer(queue_name: str, password: str) -> subprocess.Popen:
-    """Start the Java client for one queue — long-running, no `timeout`."""
+def _spawn_consumer(queue_name: str, pw_argfile: str) -> subprocess.Popen:
+    """Start the Java client for one queue — long-running, no `timeout`.
+
+    The password reaches the JVM via a 0600 @argfile (never argv — `ps`
+    exposes argv to every user on the box). stderr is captured into a
+    bounded ring buffer instead of DEVNULL so the watchdog can surface
+    the JVM's reason for dying.
+    """
     config = sc.load_config()
     feed_cfg = config["queues"][queue_name]
     broker = config["provider_urls"][feed_cfg["broker"]]
@@ -206,68 +262,96 @@ def _spawn_consumer(queue_name: str, password: str) -> subprocess.Popen:
         f"-Dqueue={feed_cfg['queue']}",
         f"-DconnectionFactory={config['connection_factory']}",
         f"-Dusername={config['username']}",
-        f"-Dpassword={password}",
+        f"@{pw_argfile}",
         f"-Dvpn={feed_cfg['vpn']}",
         "-Doutput=com.harris.cinnato.outputs.StdoutOutput",
         "-Dmetrics=false",
         "-Djson=false",
         "-Dheaders=true",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                             cwd=str(sc.SWIM_DIR))
+    with _proc_lock:
+        _child_procs.append(proc)
+    pump = threading.Thread(target=_pump_stderr,
+                            args=(queue_name, proc.stderr),
+                            daemon=True, name=f"swim-stderr-{queue_name}")
+    pump.start()
+    return proc
 
 
 def _consume_queue(queue_name: str, password: str) -> None:
-    """Watchdog loop: keep one consumer alive for this queue forever."""
-    backoff = _BACKOFF_START
-    while not _stop.is_set():
-        proc = None
+    """Watchdog loop: keep one consumer alive for this queue forever.
+
+    The password @argfile is written once per watchdog thread (not per
+    respawn) and deleted when the thread exits.
+    """
+    pw_argfile = sc.write_password_argfile(password)
+    try:
+        backoff = _BACKOFF_START
+        while not _stop.is_set():
+            proc = None
+            try:
+                proc = _spawn_consumer(queue_name, pw_argfile)
+                _log(f"{queue_name}: consumer started (pid={proc.pid})")
+                store.swim_daemon_heartbeat(queue_name, restarted=True,
+                                            note="started")
+                parser = _StreamParser()
+                last_beat = time.monotonic()
+                got_any = False
+
+                for raw in proc.stdout:  # blocks; ends when process dies
+                    if _stop.is_set():
+                        break
+                    line = raw.decode("utf-8", errors="replace")
+                    msg = parser.feed(line)
+                    if msg:
+                        n = _handle_message(queue_name, msg)
+                        got_any = True
+                        if n:
+                            store.swim_daemon_heartbeat(queue_name,
+                                                        messages_delta=n,
+                                                        got_message=True)
+                            backoff = _BACKOFF_START  # healthy stream
+                    if time.monotonic() - last_beat >= _HEARTBEAT_SECONDS:
+                        store.swim_daemon_heartbeat(queue_name)
+                        last_beat = time.monotonic()
+
+                tail = parser.flush()
+                if tail:
+                    _handle_message(queue_name, tail)
+
+                rc = proc.wait(timeout=10)
+                fatal = _fatal_stderr_line(queue_name)
+                if fatal:
+                    _log(f"{queue_name}: consumer died rc={rc}: {fatal}")
+                else:
+                    _log(f"{queue_name}: consumer exited rc={rc}"
+                         + ("" if got_any else " (no messages seen)")
+                         + (f" stderr tail: {_stderr_tail(queue_name)}"
+                            if rc else ""))
+            except Exception as exc:
+                _log(f"{queue_name}: watchdog error {type(exc).__name__}: {exc}")
+            finally:
+                if proc:
+                    with _proc_lock:
+                        if proc in _child_procs:
+                            _child_procs.remove(proc)
+                    if proc.poll() is None:
+                        proc.kill()
+
+            if _stop.is_set():
+                return
+            store.swim_daemon_heartbeat(queue_name,
+                                        note=f"restarting in {backoff}s")
+            _stop.wait(backoff)
+            backoff = min(backoff * 2, _BACKOFF_MAX)
+    finally:
         try:
-            proc = _spawn_consumer(queue_name, password)
-            _log(f"{queue_name}: consumer started (pid={proc.pid})")
-            store.swim_daemon_heartbeat(queue_name, restarted=True,
-                                        note="started")
-            parser = _StreamParser()
-            last_beat = time.monotonic()
-            got_any = False
-
-            for raw in proc.stdout:  # blocks; ends when process dies
-                if _stop.is_set():
-                    break
-                line = raw.decode("utf-8", errors="replace")
-                msg = parser.feed(line)
-                if msg:
-                    n = _handle_message(queue_name, msg)
-                    got_any = True
-                    if n:
-                        store.swim_daemon_heartbeat(queue_name,
-                                                    messages_delta=n,
-                                                    got_message=True)
-                        backoff = _BACKOFF_START  # healthy stream
-                if time.monotonic() - last_beat >= _HEARTBEAT_SECONDS:
-                    store.swim_daemon_heartbeat(queue_name)
-                    last_beat = time.monotonic()
-
-            tail = parser.flush()
-            if tail:
-                _handle_message(queue_name, tail)
-
-            rc = proc.wait(timeout=10)
-            _log(f"{queue_name}: consumer exited rc={rc}"
-                 + ("" if got_any else " (no messages seen)"))
-        except Exception as exc:
-            _log(f"{queue_name}: watchdog error {type(exc).__name__}: {exc}")
-        finally:
-            if proc and proc.poll() is None:
-                proc.kill()
-
-        if _stop.is_set():
-            return
-        store.swim_daemon_heartbeat(queue_name,
-                                    note=f"restarting in {backoff}s")
-        _stop.wait(backoff)
-        backoff = min(backoff * 2, _BACKOFF_MAX)
+            os.unlink(pw_argfile)
+        except OSError:
+            pass
 
 
 def enabled() -> bool:
@@ -303,4 +387,29 @@ def start(airline_map: dict) -> bool:
 
 
 def stop() -> None:
+    """Shut the daemon down: stop watchdogs, terminate child JVMs, join up.
+
+    Previously this only set the stop event — the JVM consumers were
+    orphaned on every redeploy/restart. Registered via atexit by app.py
+    when the daemon starts.
+    """
     _stop.set()
+    with _proc_lock:
+        procs = list(_child_procs)
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+    for proc in procs:
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    for t in list(_threads):
+        t.join(timeout=15)
+    _log("stopped")
