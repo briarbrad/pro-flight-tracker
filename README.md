@@ -37,6 +37,14 @@ weather, and FAA operational data and serves it as JSON.
    store.py  → Postgres (tracked flights, leader election)
 ```
 
+**Multi-replica tracker leadership requires `DATABASE_URL`.** With two or
+more gunicorn workers / Railway replicas, only the worker holding the
+Postgres advisory-lock lease runs the background tracker and the SWIM
+daemon; the rest stand by and take over if the lease lapses. Without
+`DATABASE_URL` there is no shared lease — every worker runs its own
+tracker against its own in-memory store, duplicating polling and burning
+AeroAPI quota per worker. Single-replica deploys are unaffected.
+
 Each script is a standalone CLI that prints JSON to stdout. Flask runs them as
 subprocesses and returns their output over HTTP. The SWIM consumer is a Python
 wrapper around the L3Harris JMS "jumpstart" client, which connects to FAA Solace

@@ -24,9 +24,28 @@ import os
 import sys
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_state():
+    """Breaker failures, usage counters, and the LLM cache are module-global;
+    reset them so tests can't trip each other's circuit breaker."""
+    app_module._narrative_cache.clear()
+    with app_module._breaker_lock:
+        app_module._breakers.pop("openrouter", None)
+    with app_module._llm_usage_lock:
+        app_module._llm_usage.clear()
+    yield
+    app_module._narrative_cache.clear()
+    with app_module._breaker_lock:
+        app_module._breakers.pop("openrouter", None)
+    with app_module._llm_usage_lock:
+        app_module._llm_usage.clear()
 
 
 def _client():

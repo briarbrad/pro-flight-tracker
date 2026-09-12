@@ -6,12 +6,15 @@
 # dies immediately with UnsupportedClassVersionError. Do not replace this
 # with `apt-get install default-jdk` — no Debian release ships Java 25 yet.
 
-FROM python:3.12-slim
+# --- Base ------------------------------------------------------------------
+FROM python:3.12-slim AS base
 
 # --- Java 25 ---------------------------------------------------------------
-# Copied straight from the official Eclipse Temurin image. No download, no
-# apt repo to go stale, and the version is pinned by the tag.
-COPY --from=eclipse-temurin:25-jre /opt/java/openjdk /opt/java/openjdk
+# Copied straight from the official Eclipse Temurin image, pinned by digest
+# (verified 2026-09-12 via registry-1.docker.io). No download, no apt repo
+# to go stale. Bump the digest deliberately, never by floating the tag.
+COPY --from=eclipse-temurin:25-jre@sha256:15090d159279e5c158473eccb48cd87f57b3e3a47511a797eb5a7a7ea6f86b0f \
+    /opt/java/openjdk /opt/java/openjdk
 ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
@@ -34,21 +37,26 @@ RUN set -eux; \
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies (pinned; see requirements.lock)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-# NOTE: these are copied by name, so a new top-level module must be added here
-# or it silently won't exist in the image and the app dies on import.
-COPY app.py .
-COPY store.py .
-COPY analysis.py .
-COPY flow_brief.py .
-COPY swim_daemon.py .
-COPY scripts/ scripts/
-COPY swim/ swim/
-COPY references/ references/
+# Copy application code. COPY . . plus .dockerignore — never a named-module
+# list: a new top-level package (like pft/) must not silently miss the image.
+COPY . .
+
+# --- Tests (blocking) ------------------------------------------------------
+# The full pytest suite runs at build time. The production stage COPY --from
+# this stage, which forces Docker to build it — a red suite fails the deploy,
+# not the first request.
+FROM base AS test
+RUN pip install --no-cache-dir -r requirements-test.txt \
+    && python -m pytest tests/ -q \
+    && touch /tmp/tests-passed
+
+# --- Production ------------------------------------------------------------
+FROM base AS prod
+COPY --from=test /tmp/tests-passed /tmp/tests-passed
 
 # Normalize line endings and make the launcher executable
 RUN dos2unix swim/bin/run && chmod +x swim/bin/run

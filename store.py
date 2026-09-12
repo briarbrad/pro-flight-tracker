@@ -59,6 +59,7 @@ if DATABASE_URL:
 
 _pool = None
 _pool_lock = threading.Lock()
+_pool_retry_at = 0.0  # monotonic deadline before retrying a failed pool open
 
 
 def using_postgres() -> bool:
@@ -77,19 +78,33 @@ def _get_pool():
     request pays a Python-level checkout instead of a fresh network
     round-trip and auth handshake.
     """
-    global _pool
+    global _pool, _pool_retry_at
     if _pool is not None or not using_postgres() or _ConnectionPool is None:
         return _pool
+    import time as _time
+    if _time.monotonic() < _pool_retry_at:
+        return None
     with _pool_lock:
-        if _pool is None:
-            _pool = _ConnectionPool(
-                DATABASE_URL,
-                min_size=1,
-                max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
-                timeout=10,       # seconds to wait for a free connection
-                max_idle=300,     # recycle idle connections after 5 min
-                open=True,
-            )
+        if _pool is None and _time.monotonic() >= _pool_retry_at:
+            try:
+                _pool = _ConnectionPool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
+                    timeout=10,       # seconds to wait for a free connection
+                    max_idle=300,     # recycle idle connections after 5 min
+                    open=True,
+                )
+            except Exception as exc:
+                # A pool that can't open (DB down at boot) must not take the
+                # app down with it: fall back to one-connection-per-call via
+                # _connect(), and don't hammer the DB retrying the open on
+                # every store call.
+                import sys as _sys
+                print(f"[STORE] Connection pool failed to open "
+                      f"({type(exc).__name__}: {exc}); using one-off "
+                      f"connections", file=_sys.stderr)
+                _pool_retry_at = _time.monotonic() + 60
     return _pool
 
 
@@ -287,7 +302,7 @@ def init() -> None:
     if not using_postgres():
         return
     try:
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
                 cur.execute(EDCT_SCHEMA)
@@ -311,7 +326,7 @@ def add(track_id: str, flight: str, date: str, push_token: str,
     expires_at = now + timedelta(hours=ttl_hours)
 
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -355,7 +370,7 @@ def add(track_id: str, flight: str, date: str, push_token: str,
 def remove(track_id: str) -> bool:
     """Stop tracking. Returns True if something was removed."""
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM tracked_flights WHERE track_id = %s",
                             (track_id,))
@@ -370,7 +385,7 @@ def remove(track_id: str) -> bool:
 def list_all() -> list[dict]:
     """Every tracked flight, newest first."""
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT {_COLS} FROM tracked_flights "
                             "ORDER BY created_at DESC")
@@ -390,7 +405,7 @@ def due_for_check(now: datetime = None) -> list[dict]:
     now = now or _now()
 
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -432,7 +447,7 @@ def mark_checked(track_id: str, when: datetime, risk: str,
     whatever interval the client happened to request at track-creation time.
     """
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 if interval_minutes is not None:
                     cur.execute(
@@ -468,7 +483,7 @@ def purge_expired(now: datetime = None) -> int:
     snapshot_cutoff = now - timedelta(hours=SNAPSHOT_RETENTION_HOURS)
 
     if using_postgres():
-        with _connect() as conn:
+        with _connect(connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM tracked_flights "
                             "WHERE expires_at IS NOT NULL AND expires_at <= %s",
@@ -477,8 +492,24 @@ def purge_expired(now: datetime = None) -> int:
                 try:
                     cur.execute("DELETE FROM flight_snapshots "
                                 "WHERE checked_at <= %s", (snapshot_cutoff,))
-                except Exception:
-                    pass  # table may not exist yet on a fresh database
+                except Exception as exc:
+                    # Fail-open only for a table that doesn't exist yet on a
+                    # fresh database. Anything else (bad SQL, permission
+                    # errors) is a bug — surface it loudly rather than
+                    # hiding it behind the purge's best-effort comment.
+                    missing_table = (
+                        _psycopg is not None
+                        and getattr(_psycopg, "errors", None) is not None
+                        and isinstance(exc, _psycopg.errors.UndefinedTable))
+                    if not missing_table:
+                        import sys as _sys
+                        print(f"[STORE] purge_expired snapshots: unexpected "
+                              f"{type(exc).__name__}: {exc}", file=_sys.stderr)
+                    else:
+                        # A failed statement aborts the whole transaction;
+                        # roll back so the tracked_flights purge above still
+                        # commits instead of dying on conn.commit().
+                        conn.rollback()
             conn.commit()
         return deleted
 
@@ -612,6 +643,34 @@ EDCT_TTL_MINUTES = 45
 _edct_mem: dict[tuple, dict] = {}
 
 
+# Maximum entries in a per-worker memory fallback when Postgres writes fail.
+# Bounded so the degraded path can't grow without limit; the oldest entries
+# (by updated_at) are evicted first.
+_MEM_FALLBACK_MAX = 500
+
+
+def _evict_mem_overflow(bucket: dict, max_entries: int = _MEM_FALLBACK_MAX) -> None:
+    """Drop the oldest entries (by updated_at) beyond max_entries.
+
+    Call with _mem_lock held.
+    """
+    overflow = len(bucket) - max_entries
+    if overflow <= 0:
+        return
+    oldest = sorted(bucket.items(),
+                    key=lambda kv: str(kv[1].get("updated_at") or ""))[:overflow]
+    for key, _ in oldest:
+        del bucket[key]
+
+
+def _log_pg_write_failure(name: str, exc: Exception) -> None:
+    """Loudly log a Postgres write failure that falls back to per-worker memory."""
+    import sys as _sys
+    print(f"[STORE] {name} Postgres write failed "
+          f"({type(exc).__name__}: {exc}); falling back to per-worker "
+          f"memory — other workers/replicas won't see it", file=_sys.stderr)
+
+
 def _edct_key(flight: str, date: str) -> tuple:
     return ((flight or "").upper(), date or "")
 
@@ -638,11 +697,12 @@ def cache_edct(flight: str, date: str, edct: dict) -> None:
                         (_edct_key(flight, date)[0], date, _json.dumps(edct), now))
                 conn.commit()
             return
-        except Exception:
-            pass  # fall through to memory so at least this worker remembers
+        except Exception as exc:
+            _log_pg_write_failure("cache_edct", exc)
     with _mem_lock:
         _edct_mem[_edct_key(flight, date)] = {"payload": dict(edct),
                                               "updated_at": now}
+        _evict_mem_overflow(_edct_mem)
 
 
 def get_cached_edct(flight: str, date: str) -> dict | None:
@@ -745,11 +805,12 @@ def cache_turn_analysis(flight: str, date: str, turn_analysis: dict) -> None:
                          _json.dumps(turn_analysis), now))
                 conn.commit()
             return
-        except Exception:
-            pass  # fall through to memory so at least this worker remembers
+        except Exception as exc:
+            _log_pg_write_failure("cache_turn_analysis", exc)
     with _mem_lock:
         _turn_mem[_turn_key(flight, date)] = {"payload": dict(turn_analysis),
                                               "updated_at": now}
+        _evict_mem_overflow(_turn_mem)
 
 
 def get_cached_turn_analysis(flight: str, date: str) -> dict | None:
@@ -817,10 +878,14 @@ _swim_mem: dict[str, list] = {}          # feed -> [{payload, flight, airport, r
 _swim_status_mem: dict[str, dict] = {}
 
 
-def swim_record_events(feed: str, records: list) -> None:
-    """Append parsed SWIM records for a feed. Best-effort, never raises."""
+def swim_record_events(feed: str, records: list) -> bool:
+    """Append parsed SWIM records for a feed. Best-effort, never raises.
+
+    Returns True when the records landed in the configured backend, False
+    when a Postgres write failed and they fell back to per-worker memory.
+    """
     if not records:
-        return
+        return True
     now = _now()
     rows = []
     import json as _json
@@ -833,7 +898,7 @@ def swim_record_events(feed: str, records: list) -> None:
         rows.append((feed, flight, airport, _json.dumps(r, default=str),
                      src_ts, now))
     if not rows:
-        return
+        return True
     if using_postgres():
         try:
             with _connect(connect_timeout=5) as conn:
@@ -846,9 +911,9 @@ def swim_record_events(feed: str, records: list) -> None:
                         "DELETE FROM swim_events WHERE received_at < %s",
                         (now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES),))
                 conn.commit()
-            return
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            _log_pg_write_failure(f"swim_record_events[{feed}]", exc)
     with _mem_lock:
         bucket = _swim_mem.setdefault(feed, [])
         for feed_, flight, airport, payload, src_ts, ts in rows:
@@ -856,6 +921,7 @@ def swim_record_events(feed: str, records: list) -> None:
                            "airport": airport, "received_at": ts})
         cutoff = now - timedelta(minutes=SWIM_EVENT_RETENTION_MINUTES)
         _swim_mem[feed] = [e for e in bucket if e["received_at"] >= cutoff][-2000:]
+    return not using_postgres()
 
 
 def swim_recent_events(feed: str, window_seconds: int = 900,
@@ -868,22 +934,23 @@ def swim_recent_events(feed: str, window_seconds: int = 900,
     uppercase, keyword is a case-insensitive substring — all against the
     stored JSON payload, so fields the per-feed parsers set (flight_id,
     airport, raw text) are all searchable.
+
+    Raises on a Postgres read failure — deliberately: callers must fall
+    back to the subprocess path (or fail loud), never present an outage
+    as "the FAA published nothing".
     """
     import json as _json
     cutoff = _now() - timedelta(seconds=window_seconds)
     raw = []
     if using_postgres():
-        try:
-            with _connect(connect_timeout=5) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT payload FROM swim_events "
-                        "WHERE feed = %s AND received_at >= %s "
-                        "ORDER BY received_at DESC LIMIT 500",
-                        (feed, cutoff))
-                    raw = [r[0] for r in cur.fetchall()]
-        except Exception:
-            raw = []
+        with _connect(connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payload FROM swim_events "
+                    "WHERE feed = %s AND received_at >= %s "
+                    "ORDER BY received_at DESC LIMIT 500",
+                    (feed, cutoff))
+                raw = [r[0] for r in cur.fetchall()]
     else:
         with _mem_lock:
             raw = [e["payload"] for e in reversed(_swim_mem.get(feed, []))
@@ -965,7 +1032,14 @@ def swim_daemon_heartbeat(queue_name: str, messages_delta: int = 0,
 
 
 def swim_daemon_health(queue_name: str) -> dict:
-    """{"alive": bool, ...} — alive means a recent heartbeat exists."""
+    """{"alive": bool, ...} — alive means a recent heartbeat exists.
+
+    A DB read failure is reported as {"alive": False, "db_error": True},
+    NOT as plain dead: the daemon may be perfectly alive and only the
+    heartbeat read failed. Callers must not treat db_error as permission
+    to spawn a competing per-request consumer — JMS delivers each message
+    to exactly one consumer, so that would steal the daemon's messages.
+    """
     row = None
     if using_postgres():
         try:
@@ -976,8 +1050,11 @@ def swim_daemon_health(queue_name: str) -> dict:
                         "restarts, note FROM swim_daemon_status "
                         "WHERE queue_name = %s", (queue_name,))
                     row = cur.fetchone()
-        except Exception:
-            row = None
+        except Exception as exc:
+            import sys as _sys
+            print(f"[STORE] swim_daemon_health read failed "
+                  f"({type(exc).__name__}: {exc})", file=_sys.stderr)
+            return {"alive": False, "db_error": True}
         if row:
             last_alive, last_msg, total, restarts, note = row
         else:
@@ -1050,3 +1127,103 @@ def acquire_leadership() -> bool:
         return True
     except (OSError, BlockingIOError):
         return False
+
+
+def validate_leadership() -> bool:
+    """Re-validate the advisory lock this process believes it holds.
+
+    The lock is session-scoped: a Postgres restart or a silently dead TCP
+    session drops it server-side while the client socket looks fine. The
+    old process would keep running the tracker believing it is leader and
+    a new process would acquire the freed lock — two trackers polling,
+    AeroAPI billed twice. Call once per tracker cycle; it is one cheap
+    round-trip on an already-open connection.
+    """
+    global _leader_conn
+    if not using_postgres():
+        return True  # flock is fd-held; nothing to re-validate
+    conn = _leader_conn
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            # pg_try_advisory_lock is re-entrant: true when this session
+            # already holds the lock, and the SELECT itself proves the
+            # session is still alive.
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (_LEADER_LOCK_KEY,))
+            return bool(cur.fetchone()[0])
+    except Exception as exc:
+        import sys as _sys
+        print(f"[STORE] Leadership validation failed "
+              f"({type(exc).__name__}: {exc}); releasing claim",
+              file=_sys.stderr)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _leader_conn = None
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Shared rate-limit counters
+#
+# The app's per-minute rate cap must be enforced cluster-wide: with
+# --workers 2 (or multiple replicas), a per-process bucket lets every
+# worker serve the full limit. When Postgres is configured, the counter
+# lives here — one atomic upsert per request — so all workers and
+# replicas share it. Without Postgres, app.py falls back to its
+# per-process bucket and says so in the 429 body.
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    bucket_key TEXT PRIMARY KEY,
+    window_start TIMESTAMPTZ NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+_rate_limit_pruned_at = 0.0
+
+
+def rate_limit_check(bucket_key: str, limit_per_min: int) -> int:
+    """Count one request against the shared per-minute bucket.
+
+    Returns seconds to wait (0 = ok). Atomic single-statement upsert:
+    concurrent workers can't both read-then-write the same count.
+    Raises on Postgres failure — the caller falls back to per-process.
+    """
+    global _rate_limit_pruned_at
+    import time as _time
+    now = _now()
+    cutoff = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+    with _connect(connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute(RATE_LIMIT_SCHEMA)  # lazy-create
+            cur.execute(
+                "INSERT INTO rate_limit_counters AS r "
+                "(bucket_key, window_start, count) "
+                "VALUES (%s, %s, 1) "
+                "ON CONFLICT (bucket_key) DO UPDATE SET "
+                "count = CASE WHEN r.window_start < %s THEN 1 "
+                "ELSE r.count + 1 END, "
+                "window_start = CASE WHEN r.window_start < %s THEN %s "
+                "ELSE r.window_start END "
+                "RETURNING count, window_start",
+                (bucket_key, now, cutoff, cutoff, now))
+            count, window_start = cur.fetchone()
+            # Opportunistic prune of dead buckets, at most every 10 min.
+            if _time.monotonic() - _rate_limit_pruned_at > 600:
+                cur.execute(
+                    "DELETE FROM rate_limit_counters "
+                    "WHERE window_start < %s",
+                    (now - timedelta(minutes=10),))
+                _rate_limit_pruned_at = _time.monotonic()
+        conn.commit()
+    if count > limit_per_min:
+        window_end = window_start + timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+        return max(1, int((window_end - now).total_seconds()) + 1)
+    return 0

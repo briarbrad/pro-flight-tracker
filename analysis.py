@@ -174,7 +174,9 @@ def compute_phase(flight: dict, now: datetime = None) -> dict:
             next_time = act_on + timedelta(minutes=TAXI_IN_TYPICAL_MIN)
             next_basis = f"landing + {TAXI_IN_TYPICAL_MIN} min typical taxi-in"
 
-    elapsed = round((now - since).total_seconds() / 60.0) if since else None
+    elapsed = (round((now - since).total_seconds() / 60.0) if since else None)
+    if elapsed is not None:
+        elapsed = max(0, elapsed)  # clock skew must never report negative time
     to_next = ((next_time - now).total_seconds() / 3600.0
                if next_time else None)
 

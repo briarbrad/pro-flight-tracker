@@ -96,6 +96,29 @@ FATAL_STDERR_MARKERS = (
 )
 
 
+def write_password_argfile(password: str) -> str:
+    """Write -Dpassword into a 0600 java @argfile; return its path.
+
+    The password must never appear in the process argv — `ps` exposes argv
+    to every user on the box. The java launcher expands @argfiles itself,
+    so the JAR still receives a plain -Dpassword property. Caller must
+    delete the file when the JVM exits (or when the daemon stops).
+    """
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="swim-pw-", suffix=".args")
+    try:
+        os.fchmod(fd, 0o600)
+        # JEP 293 quoting: one arg per line; double quotes group, backslash
+        # and quote escaped. Passwords don't contain newlines; reject them.
+        if "\n" in password or "\r" in password:
+            raise ValueError("password must not contain newlines")
+        escaped = password.replace("\\", "\\\\").replace('"', '\\"')
+        os.write(fd, f'-Dpassword="{escaped}"\n'.encode())
+    finally:
+        os.close(fd)
+    return path
+
+
 def run_consumer(feed: str, duration: int, password: str) -> list:
     """
     Run the Java jumpstart consumer for `duration` seconds,
@@ -120,6 +143,9 @@ def run_consumer(feed: str, duration: int, password: str) -> list:
         except OSError:
             pass
 
+    # Password reaches the JVM via a 0600 @argfile, never via argv —
+    # `ps` exposes argv to every user on the box. Deleted in the finally.
+    pw_argfile = write_password_argfile(password)
     cmd = [
         'timeout', str(duration), str(RUN_SCRIPT),
         '-Djava.net.preferIPv4Stack=true',
@@ -127,7 +153,7 @@ def run_consumer(feed: str, duration: int, password: str) -> list:
         f'-Dqueue={feed_cfg["queue"]}',
         f'-DconnectionFactory={config["connection_factory"]}',
         f'-Dusername={config["username"]}',
-        f'-Dpassword={password}',
+        f'@{pw_argfile}',
         f'-Dvpn={feed_cfg["vpn"]}',
         '-Doutput=com.harris.cinnato.outputs.StdoutOutput',
         '-Dmetrics=false',
@@ -135,24 +161,30 @@ def run_consumer(feed: str, duration: int, password: str) -> list:
         '-Dheaders=true',
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(SWIM_DIR),
-    )
-
     try:
-        stdout, stderr = proc.communicate(timeout=duration + 15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(SWIM_DIR),
+        )
 
-    # Only parse stdout (clean message output); stderr is JVM logging
-    output = stdout.decode('utf-8', errors='replace') if stdout else ''
-    LAST_STDERR = stderr.decode('utf-8', errors='replace') if stderr else ''
+        try:
+            stdout, stderr = proc.communicate(timeout=duration + 15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
 
-    return parse_raw_output(output)
+        # Only parse stdout (clean message output); stderr is JVM logging
+        output = stdout.decode('utf-8', errors='replace') if stdout else ''
+        LAST_STDERR = stderr.decode('utf-8', errors='replace') if stderr else ''
+
+        return parse_raw_output(output)
+    finally:
+        try:
+            os.unlink(pw_argfile)
+        except OSError:
+            pass
 
 
 def stderr_diagnostic() -> str:

@@ -1,0 +1,2 @@
+# Test-only dependencies (not installed in production images).
+pytest==9.1.1

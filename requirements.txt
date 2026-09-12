@@ -1,29 +1,33 @@
 # Pro Flight Tracker — Python Dependencies
+#
+# Pinned to verified versions (requirements.lock holds the full transitive
+# closure). Generated 2026-09-12 from an isolated install; never hand-edit
+# a pin without reinstalling and re-running the suite.
 
 # Web server
-flask>=3.0
-flask-cors>=4.0
-gunicorn>=22.0
+flask==3.1.3
+flask-cors==6.0.5
+gunicorn==26.2.0
 
 # Airport ops: lightning detection (Blitzortung WebSocket)
-websockets>=12.0
+websockets==17.1
 
 # Airport ops: RVR HTML parsing
-beautifulsoup4>=4.12
-lxml>=5.0
+beautifulsoup4==4.15.0
+lxml==6.1.3
 
 # HTTP client (used by some scripts)
-requests>=2.31
+requests==2.34.2
 
 # Tracking store — used when DATABASE_URL is set (Railway Postgres).
 # Without it the app falls back to in-memory tracking automatically.
-psycopg[binary]>=3.2
+psycopg[binary]==3.3.5
 
 # Connection pooling for the Postgres store — without this every store call
 # (including the tracker's own per-flight loop) opens and closes a brand new
 # connection. store.py degrades gracefully to one-connection-per-call if
 # this package is ever missing, so it's an optional-but-recommended pin.
-psycopg_pool>=3.2
+psycopg_pool==3.3.1
 
 # Async support for lightning WebSocket
-aiohttp>=3.9
+aiohttp==3.14.3
