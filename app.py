@@ -140,7 +140,15 @@ def _token_ok(supplied: str) -> bool:
     expected = os.environ.get("API_TOKEN", "").strip()
     if not expected:
         return False
-    return hmac.compare_digest(supplied.encode(), expected.encode())
+    # hmac.compare_digest raises ValueError when the inputs differ in
+    # length. During the documented dormant-auth rollout the iOS app may
+    # already be sending a bearer token of a different size than Railway's
+    # API_TOKEN — that used to 500 every request (including in log-only
+    # mode) instead of treating it as "not authed". Hash both sides to a
+    # fixed length first so a mismatch is just False.
+    supplied_digest = hashlib.sha256((supplied or "").encode("utf-8")).digest()
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(supplied_digest, expected_digest)
 
 
 @app.before_request
@@ -808,13 +816,37 @@ def rekey_airports(payload, mapping: dict):
     return payload
 
 
-def clean_duration(value: str, default: int, lo: int = 1, hi: int = 30) -> str:
-    """Coerce a duration to a sane int, falling back to the endpoint default."""
+def clean_int(value: str, default: int, lo: int, hi: int) -> str:
+    """Coerce an int into [lo, hi], falling back to default on junk."""
     try:
         n = int(clean_param(value, 8))
     except (TypeError, ValueError):
         n = default
     return str(max(lo, min(hi, n)))
+
+
+def clean_duration(value: str, default: int, lo: int = 1, hi: int = 30) -> str:
+    """Coerce a duration to a sane int, falling back to the endpoint default."""
+    return clean_int(value, default, lo, hi)
+
+
+def _status_prefetch_env(status_data) -> dict | None:
+    """Build env extras so chain/track reuse a status payload we already paid for.
+
+    /api/check, /api/brief, and the background tracker all fetch `status`
+    first and then (sometimes) `chain` for the same ident. Without this,
+    cmd_chain re-hits /flights/{ident} — one wasted AeroAPI query per call.
+    Returns None when the payload isn't reusable so callers fall through
+    to a live fetch.
+    """
+    if not isinstance(status_data, dict):
+        return None
+    if not (status_data.get("data") or {}).get("flights"):
+        return None
+    try:
+        return {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
+    except (TypeError, ValueError):
+        return None
 
 
 def run_scripts_parallel(tasks: list[dict], max_workers: int = 6,
@@ -881,7 +913,7 @@ def health():
     return jsonify({
         "status": "ok" if store_info.get("ok") else "degraded",
         "service": "pro-flight-tracker",
-        "version": "1.9",
+        "version": "1.10",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_info,
         "tracker_leader": TRACKER_IS_LEADER,
@@ -1149,6 +1181,11 @@ def _swim_call(feed: str, default_duration: int, airport_required: bool = False,
     # used to reliably outrun the subprocess timeout and 504.
     duration = clean_duration(request.args.get("duration", ""), default_duration,
                               hi=20)
+    # --limit used to be hardcoded at 50 in swim_consumer.py with no query
+    # parameter to raise it, so filtered_results==50 meant "at least 50".
+    # Clamp 1–200: high enough for a busy airport window, low enough that
+    # a tfdm/stdds firehose can't blow up a response.
+    limit = clean_int(request.args.get("limit", ""), 50, lo=1, hi=200)
 
     if airport_required and not airport:
         return jsonify({
@@ -1163,7 +1200,7 @@ def _swim_call(feed: str, default_duration: int, airport_required: bool = False,
         args += ["--flight", flight]
     if allow_keyword and keyword:
         args += ["--keyword", keyword]
-    args += ["--duration", duration]
+    args += ["--duration", duration, "--limit", limit]
 
     data, status = run_script("swim_consumer.py", args, timeout=SWIM_TIMEOUT)
     return jsonify(data), status
@@ -1431,13 +1468,7 @@ def check_flight():
     # Also run equipment chain in parallel with phase 2.
     # Hand it the Phase 1 flight status so it doesn't re-buy /flights/{ident}
     # from AeroAPI — that saves one query on every single check.
-    chain_env = None
-    if status_code == 200 and isinstance(status_data, dict):
-        if (status_data.get("data") or {}).get("flights"):
-            try:
-                chain_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
-            except (TypeError, ValueError):
-                chain_env = None
+    chain_env = _status_prefetch_env(status_data) if status_code == 200 else None
 
     phase2_tasks.append({
         "key": "equipment_chain",
@@ -1497,13 +1528,19 @@ def start_tracking():
       interval_minutes (optional): check interval, default 15
     """
     body = request.get_json(silent=True) or {}
-    flight = body.get("flight")
-    push_token = body.get("push_token")
+    flight = clean_ident(body.get("flight") or "")
+    push_token = (body.get("push_token") or "").strip()
 
     if not flight or not push_token:
-        return jsonify({"error": "Missing 'flight' and/or 'push_token'"}), 400
+        return jsonify({"error": "Missing or invalid 'flight' and/or 'push_token'"}), 400
 
-    date = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    # body.get("date", today) treated date="" / date=null as a real value and
+    # stored track_id "DL244_" / "DL244_None", then the tracker spent AeroAPI
+    # credit polling a date that can never match. Invalid dates fall back to
+    # UTC today, same as /api/check and /api/flight/live.
+    date = clean_date(body.get("date") or "")
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Guard the interval: below ~5 minutes the AeroAPI spend climbs fast and
     # you risk the Personal tier's 10 result-sets/minute limit.
@@ -1529,8 +1566,12 @@ def start_tracking():
 @app.route("/api/track", methods=["DELETE"])
 def stop_tracking():
     """Stop tracking a flight."""
-    flight = request.args.get("flight")
-    date = request.args.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    flight = clean_ident(request.args.get("flight", ""))
+    date = clean_date(request.args.get("date", ""))
+    if not flight:
+        return jsonify({"error": "Missing or invalid 'flight' parameter"}), 400
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     track_id = f"{flight}_{date}"
 
     if store.remove(track_id):
@@ -1726,7 +1767,9 @@ def flight_brief():
     if not flight:
         return jsonify({"error": "Missing or invalid 'flight' parameter",
                         "hint": "e.g. flight=DL244"}), 400
-    date = clean_param(date or datetime.now(timezone.utc).strftime("%Y-%m-%d"), 12)
+    date = clean_date(date or "")
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     aeroapi_queries = 0
     sources = {}
@@ -1815,12 +1858,7 @@ def flight_brief():
         pos_args = ["track", "--flight", flight]
         if primary.get("registration"):
             pos_args += ["--reg", primary["registration"]]
-        pos_env = None
-        if isinstance(status_data, dict):
-            try:
-                pos_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
-            except (TypeError, ValueError):
-                pos_env = None
+        pos_env = _status_prefetch_env(status_data)
         tasks.append({"key": "position", "script": "flight_data.py",
                       "args": pos_args, "timeout": 20,
                       "env_extras": pos_env})
@@ -1839,12 +1877,7 @@ def flight_brief():
     # --- Step 4: equipment chain, only when it's actually knowable.
     turn_analysis = {}
     if plan["equipment_chain"]["relevant"]:
-        chain_env = None
-        if isinstance(status_data, dict):
-            try:
-                chain_env = {"PFT_PREFETCHED_STATUS": json.dumps(status_data)}
-            except (TypeError, ValueError):
-                chain_env = None
+        chain_env = _status_prefetch_env(status_data)
         chain_data, chain_code = run_script(
             "flight_data.py", ["chain", "--flight", flight, "--date", date],
             timeout=30, env_extras=chain_env)
@@ -2665,7 +2698,8 @@ def background_tracker():
                 date = info["date"]
 
                 # Phase 1 — flight status + flow advisories.
-                # flight_data.py status = 2 AeroAPI queries; SWIM is free.
+                # flight_data.py status = 1 AeroAPI query (route is opt-in
+                # and the tracker never buys it); SWIM is free.
                 quick_tasks = [
                     {
                         "key": "flight_status",
@@ -2726,8 +2760,9 @@ def background_tracker():
                 # binding equipment constraint sitting there for hours could
                 # never raise risk or fire an alert on its own. Reuse a
                 # fresh cached finding for free first (e.g. from a brief the
-                # user already ran); only pay for a fresh lookup (2 AeroAPI
-                # queries) when there's no fresh cache AND the horizon says
+                # user already ran); only pay for a fresh lookup (1 AeroAPI
+                # inbound query — status is prefetched) when there's no fresh
+                # cache AND the horizon says
                 # it's still knowable pre-pushback — same window /api/brief
                 # itself gates on, so this can't get expensive far out.
                 turn_analysis = {}
@@ -2736,10 +2771,15 @@ def background_tracker():
                     if cached_turn:
                         turn_analysis = cached_turn["payload"]
                     else:
+                        # Reuse Phase 1 status so chain doesn't re-buy
+                        # /flights/{ident}. /api/check and /api/brief already
+                        # did this; the tracker was the remaining spender.
+                        status_payload = results.get("flight_status", {}).get("data")
                         chain_data, chain_code = run_script(
                             "flight_data.py",
                             ["chain", "--flight", flight, "--date", date],
-                            timeout=30)
+                            timeout=30,
+                            env_extras=_status_prefetch_env(status_payload))
                         if chain_code == 200 and isinstance(chain_data, dict):
                             inner = chain_data.get("data") or {}
                             turn_analysis = inner.get("turn_analysis") or {}

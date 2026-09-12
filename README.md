@@ -103,6 +103,7 @@ pro-flight-tracker/
 ├── store.py                Tracking store (Postgres / in-memory) + leader election
 ├── analysis.py             Flight phase, horizon gating, Branch A/B,
 │                           taxi/position analysis, LLM prompt payload
+├── swim_daemon.py          Persistent SWIM consumer (leader process only)
 ├── Dockerfile              Python 3.12 + Java 25. Copies files BY NAME —
 │                             a new top-level module must be added here
 ├── Procfile                gunicorn process definition
@@ -111,6 +112,7 @@ pro-flight-tracker/
 ├── README.md               This file
 ├── RORK_BRIEF.md           API contract for client developers
 ├── SETUP.md                Deployment, env vars, troubleshooting
+├── tests/                  Pytest regressions (not copied into the image)
 ├── scripts/
 │   ├── flight_data.py      AeroAPI + ADS-B + OpenSky
 │   ├── aviation_weather.py METAR/TAF/SIGMET/PIREP/FAA status
@@ -142,6 +144,7 @@ pro-flight-tracker/
 | `OPENROUTER_API_KEY` | required for `/api/narrative` and `/api/chat` | Server-side secret shared by both AI features. Create a key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and set it here — never in the iOS app bundle. Without it, both endpoints return `501`; `/api/narrative`'s client falls back to the deterministic verdict with no prose narrative, and the chat button should hide/disable itself client-side (see `RORK_BRIEF.md`) |
 | `NARRATIVE_CACHE_TTL_SECONDS` | optional | How long `/api/narrative` caches an identical (system, user, facts) response before calling OpenRouter again (default `180`, `0` disables caching). `/api/chat` is never cached — every question is different |
 | `API_TOKEN` / `REQUIRE_AUTH` | optional | Bearer-token auth, dormant until `REQUIRE_AUTH=1` is set (see `app.py`'s auth section for the rollout sequence). `API.swift` already sends `Config.EXPO_PUBLIC_BACKEND_API_TOKEN` as a bearer token when configured, so enabling this needs no new iOS code — only matching values on both sides |
+| `RATE_LIMIT_PER_MIN` | optional | Per-worker request cap, always on (default `60`). Cluster-wide cap is up to `workers ×` this value |
 
 SWIM usernames, queue names, and broker assignments live in `swim/config.json`,
 not in env vars.
@@ -150,25 +153,31 @@ not in env vars.
 
 ## Known issues
 
-**SWIM results cap at 50** with no query parameter to raise it — `--limit` is
-hardcoded in `swim_consumer.py`.
-
 **Response envelopes are inconsistent** across endpoint families. See
-[RORK_BRIEF.md §2](RORK_BRIEF.md).
+[RORK_BRIEF.md §2](RORK_BRIEF.md). SWIM `filtered_results` still defaults
+to 50; pass `limit=` (clamped 1–200) to raise it.
 
 ---
 
 ## Version history
 
-> **Note:** `/health` currently reports `"version": "1.8"` in some older deploys, but this list and
-> RORK_BRIEF.md had drifted to v1.3/v1.5 respectively, and v1.4–v1.7 were
-> never logged here. Rather than guess at unlogged history, this entry only
-> documents the fix made in this pass — please backfill v1.4–v1.7 from
-> memory/commit history if it matters, and bump `app.py`'s health-check
-> version string on every future change so this list and `/health` can't
-> drift again.
+`/health` reports `"version": "1.10"`. Bump that string, this list, and
+RORK_BRIEF.md together on every behavior change.
 
-- **v1.9** (current) — Backend hardening pass:
+- **v1.10** (current) — Correctness / spend / auth hardening:
+  - Background tracker now reuses the Phase 1 status payload when it runs
+    `chain`, matching `/api/check` and `/api/brief`. It had been the last
+    path still re-buying `/flights/{ident}` on every equipment-chain poll.
+  - Bearer-token compare no longer 500s when the client sends a
+    differently-sized token (hmac.compare_digest raises on length mismatch).
+    The documented dormant-auth rollout is safe again.
+  - `POST`/`DELETE /api/track` sanitize flight + date the same way as every
+    other endpoint. Empty/`null`/junk dates no longer create `DL244_` /
+    `DL244_None` tracks that the tracker billed AeroAPI for indefinitely.
+  - SWIM endpoints accept `limit=` (1–200, default 50).
+  - `postgres://` DATABASE_URLs are normalized to `postgresql://`.
+  - Leftover already-applied `*.patch` files removed.
+- **v1.9** — Backend hardening pass:
   - Circuit breaker now inspects the response body, not just HTTP status —
     a `200` that's actually a bare `{"error": ...}` with no usable content
     (a real upstream failure some provider scripts can return) used to read
