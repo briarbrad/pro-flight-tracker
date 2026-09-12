@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.10","timestamp":"...",
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.11","timestamp":"...",
    "store":{...},"tracker_leader":true,"cache_entries":N,"breakers":{...},"swim_daemon":{...}}
 ```
 
@@ -149,6 +149,7 @@ empirically before relying on it.
 | `GET /api/weather/pirep` | `icao` (req), `distance` (default `200`, clamped 1–500) | Array + `count` |
 | `GET /api/weather/faa-status` | `icao` (comma-separated) | GDPs / ground stops, keyed by airport |
 | `GET /api/weather/brief` | `origin`, `dest` | Combined route briefing |
+| `GET /api/weather/open-meteo` | `icao` (comma-separated), `hours` (1–48, default 12) | Open-Meteo **model guidance** (no API key). Precip probability, wind gusts, visibility-ish. **Not a TAF** — never invents VFR/IFR. See §4d |
 
 **Airport codes: send either form.** 3-letter (`JFK`) and 4-letter ICAO
 (`KJFK`) both work on every endpoint that takes an airport, including the
@@ -168,7 +169,8 @@ conversion happened, a top-level `resolved` map shows it
 | `GET /api/ops/tcf` | `route` (comma-separated) | TFM Convective Forecast — thunderstorm coverage/confidence 2-6h out, the product FAA traffic management actually uses to call ground stops/reroutes. Without `route`, dumps every active polygon nationwide |
 | `GET /api/ops/lightning` | `icao` (req), `radius` (default `20`), `duration` (default `10`) | **Blocks for `duration` seconds** — it's a live WebSocket capture |
 | `GET /api/ops/rvr` | `airport` (req; `icao` also accepted) | Either code form works |
-| `GET /api/ops/atfm` | `flight` (req), `date` | Eurocontrol regulation inference |
+| `GET /api/ops/atfm` | `flight` (req), `date` | Eurocontrol regulation inference (**costs AeroAPI** — prefer the heuristic already on `/api/brief` / `/api/flight/live`) |
+| `GET /api/ops/flow-brief` | `flight`, `date`, `origin`, `dest` (flexible; at least one of flight/origin/dest), `duration` (4–12, default 8) | Interpreted ATC flow: TFMS-flow + TBFM + TFDM in parallel. See §4c |
 
 ### FAA SWIM — free (subscription-based), but slow
 
@@ -504,6 +506,33 @@ attention (EDCT assigned, turn below minimum, ground stop at destination);
 encoded here — a GDP at the departure airport is INFO for a departure, ACTION
 territory only for flights arriving there.
 
+**`source` values you will see** (v1.11): `faa_status`, `swim_tfms`,
+`equipment_chain`, `taf`, `taxi`, `position`, **`gairmet`**, **`atfm`**.
+`gairmet` is emitted only when `/api/brief` already consulted the G-AIRMET
+script (horizon ≤12h, not taxi-in) and `relevant[]` is non-empty. `atfm`
+is the Eurocontrol CTOT heuristic run **in-process on the status payload
+already paid for** — no extra AeroAPI query. It appears on `/api/brief`
+and `/api/flight/live` when the destination is in Eurocontrol airspace
+and the horizon is ≤12h. `NO_INDICATION` / non-European dest emit nothing.
+
+A matching top-level `atfm` object is included on brief and live:
+
+```json
+"atfm": {
+  "applicable": true,
+  "destination": "EGLL",
+  "in_eurocontrol": true,
+  "verdict": "PROBABLE",
+  "confidence_pct": 70,
+  "delay_min": 30,
+  "indicators": [ { "type": "...", "detail": "...", "weight": 30 } ],
+  "note": "..."
+}
+```
+
+`applicable: false` (US-domestic dest) is the common case — the key is
+always present so you can check the flag, not key presence.
+
 **`predicted_times`** — gate departure, takeoff, gate arrival, each with:
 
 ```json
@@ -539,14 +568,42 @@ moving it. This is what makes a 12h+ flight assessable at all — beyond ~6h the
 TAF is the only source still in play.
 
 **`isigmet` and `tcf` (added)** — both consulted within a 6h horizon and
-included in `sources` / `llm_payload.facts`, same treatment as `sigmet` and
-`gairmet` already got: raw findings for the model to reason about, not
-deterministic verdict inputs. Only `taf_windows` escalates the verdict itself;
-these two widen situational awareness without another escalation path to keep
-calibrated. `isigmet` is gated the same way as in `/api/check` — only fetched
+included in `sources` / `llm_payload.facts`. `gairmet` now *also* contributes
+deterministic `effects[]` (`source: "gairmet"`) when `relevant[]` is
+non-empty — SEV/EXTM turbulence is WATCH, not ACTION, because a G-AIRMET
+is not a ground-delay mechanism. Only `taf_windows` escalates the verdict
+itself. `isigmet` is gated the same way as in `/api/check` — only fetched
 when the route leaves CONUS. `tcf` is always fetched once origin/dest are
 known and within horizon; its `relevant[]` array is empty (not absent) when no
 convective forecast area intersects the route.
+
+**`extended_weather` (v1.11)** — present on `/api/brief` when the horizon
+band is `SAME_DAY`, `NEXT_DAY`, or `DISTANT`. Compact Open-Meteo model
+guidance for origin/dest (precip probability, gusts, visibility in metres).
+`null` on nearer bands where TAF/METAR still cover the window. **Never
+an aviation flight category.** Same object lives in `llm_payload.facts`
+with a guardrail telling the model not to override a TAF.
+
+```json
+"extended_weather": {
+  "label": "model_guidance",
+  "source": "open-meteo",
+  "note": "Numerical weather model guidance via Open-Meteo...",
+  "airports": {
+    "KJFK": {
+      "icao": "KJFK",
+      "label": "model_guidance",
+      "current": { "temp_c": 18.2, "wind_gust_kts": 22.0, "visibility_m": 16000 },
+      "next_6h": {
+        "max_precip_probability_pct": 80,
+        "max_wind_gust_kts": 28.0,
+        "min_visibility_m": 4000
+      },
+      "hourly": [ { "time": "2026-09-12T15:00", "precip_probability_pct": 40 } ]
+    }
+  }
+}
+```
 
 ### `taxi` — is this wait abnormal?
 
@@ -642,9 +699,9 @@ Cheaper than `/api/check`, and it scales down with distance:
 
 | Phase / horizon | AeroAPI queries | Sources consulted |
 |---|---|---|
-| `PRE_GATE`, 0–6h | 4 | 8–12 (adds `isigmet` on non-CONUS routes, `tcf` always) |
-| `PRE_GATE`, 6–12h | 4 | 7–10 |
-| `PRE_GATE`, 12h+ | **2** | 2 |
+| `PRE_GATE`, 0–6h | 4 | 8–12 (adds `isigmet` on non-CONUS routes, `tcf` always; `atfm` in-process if dest is European) |
+| `PRE_GATE`, 6–12h | 4 | 7–11 (`open_meteo` + `atfm` heuristic; still 4 AeroAPI) |
+| `PRE_GATE`, 12h+ | **2** | 3–4 (`taf` + `open_meteo` model guidance) |
 | `TAXI_OUT` | **2** (3 if ADS-B misses) | 10–13 |
 | `AIRBORNE` | **2** (3 if ADS-B misses) | 3–5 |
 | `TAXI_IN` | **2** | 2 |
@@ -726,6 +783,154 @@ not_consulted were deliberately excluded; do not speculate about them."
 Render `verdict` and `branch_classification` directly from the JSON. Use the
 narrative only for prose — that way the numbers on screen are always the
 deterministic ones, even if the narrative call is slow or fails.
+
+---
+
+## 4c. `/api/ops/flow-brief` — interpreted ATC flow (v1.11)
+
+```
+GET /api/ops/flow-brief?flight=DL244&date=2026-09-12&origin=KJFK&dest=EGLL
+GET /api/ops/flow-brief?origin=JFK&dest=LHR
+GET /api/ops/flow-brief?flight=DL244          # resolves airports via 1 AeroAPI status
+```
+
+Highest-priority nerd endpoint. Fans out **in parallel** to the existing
+SWIM scripts with a capped listen (`duration` 4–12s, default 8) and a
+hard request deadline (~duration + 16s). The iOS client should render
+this JSON as-is — do not re-derive meaning from raw Envelope C.
+
+| Feed | What we ask | When skipped (still 200) |
+|---|---|---|
+| `tfms-flow` | origin and dest keywords / GDP / MIT / TMI | Airport is not US NAS (`K*`) |
+| `tbfm` | dest arrival metering, filtered by callsign when `flight` is given | Dest is not US NAS |
+| `tfdm` | origin (and dest if deployed) taxi queue / earliest wheels-up | Airport is not in the TFDM set — **JFK and LGA are not**. Empty is success |
+
+Quiet feeds = empty arrays / null fields, **never HTTP 500**. A missing
+`SWIM_PASSWORD`, a timeout, or an undeployed airport all look like
+`sources_quiet`.
+
+**Params** (all optional except at least one of `flight` / `origin` / `dest`):
+
+| Param | Notes |
+|---|---|
+| `flight` | Used for TBFM/TFDM callsign match. If origin/dest omitted, costs **1 AeroAPI** status lookup |
+| `date` | YYYY-MM-DD; only needed when resolving airports from `flight` |
+| `origin` / `dest` | ICAO or IATA. `LHR` and `KLHR` both become `EGLL` |
+| `departure` / `destination` / `arrival` | Aliases for origin/dest |
+| `duration` | SWIM listen seconds, clamped 4–12, default 8 |
+
+**Response shape:**
+
+```json
+{
+  "flight": "DL244",
+  "date": "2026-09-12",
+  "origin": "KJFK",
+  "dest": "EGLL",
+  "generated_at": "2026-09-12T14:02:01+00:00",
+  "duration_seconds": 8,
+  "advisories": [
+    {
+      "title": "GDP FOR EWR",
+      "text": "GROUND DELAY PROGRAM AT EWR DUE TO WEATHER",
+      "severity": "WATCH",
+      "airport": "KEWR",
+      "source": "tfms-flow",
+      "effective_start": "2026-09-12T12:00:00Z",
+      "effective_end": "2026-09-12T20:00:00Z",
+      "kind": "advisory"
+    }
+  ],
+  "metering": {
+    "applicable": false,
+    "airport": "EGLL",
+    "items": [],
+    "count": 0,
+    "note": "EGLL is outside the US NAS — TBFM arrival metering is not published for this destination."
+  },
+  "surface": {
+    "applicable": false,
+    "airport": "KJFK",
+    "queue_wait_min": null,
+    "estimated_taxi_out_min": null,
+    "earliest_wheels_up": null,
+    "state": null,
+    "note": "KJFK is not in the TFDM deployment set (JFK/LGA are not live; KEWR is the NY-area airport). Empty is success."
+  },
+  "surface_dest": null,
+  "effects": [
+    {
+      "cause": "GDP FOR EWR",
+      "effect": "A ground delay program meters arrivals into the named airport...",
+      "severity": "WATCH",
+      "source": "tfms-flow"
+    }
+  ],
+  "sources_tried": ["tfms-flow:origin"],
+  "sources_quiet": ["tfms-flow:origin", "tbfm", "tfdm:origin"],
+  "sources_skipped": ["tfms-flow:dest", "tbfm", "tfdm:origin", "tfdm:dest"],
+  "timings": { "total": 9.4, "tfms_flow_origin": 9.4 },
+  "aeroapi_queries_used": 0,
+  "note": "SWIM captures are short live listens. Empty arrays mean the feed was quiet or not deployed — not a server error."
+}
+```
+
+`effects[]` uses the same `{cause, effect, severity, source}` vocabulary
+as `/api/brief`. `metering.items[]` is `{flight_id, fix, eta, status,
+dest_airport, dep_airport, this_flight}`.
+
+**Cost:** $0 SWIM when origin/dest are passed. 1 AeroAPI query only if
+you omit airports and pass `flight`. Do **not** poll this on the live
+tile refresh — it is a same-day deep dive, not a 30-second loop.
+
+`/api/brief` does **not** add extra TBFM/TFDM SWIM calls (those are
+already slow and were left on this dedicated endpoint). The brief still
+runs `tfms-flow` / `tfms-flight` when the horizon plan already includes
+them.
+
+---
+
+## 4d. `/api/weather/open-meteo` — model guidance (v1.11)
+
+```
+GET /api/weather/open-meteo?icao=KJFK
+GET /api/weather/open-meteo?icao=JFK,LHR&hours=18
+```
+
+No API key. Envelope A (`pull_time`, `command`, `data` keyed by the
+codes you sent, plus `label` / `note`). Each station block:
+
+```json
+{
+  "icao": "KJFK",
+  "label": "model_guidance",
+  "source": "open-meteo",
+  "coord_source": "airport_table",
+  "coords": { "lat": 40.6413, "lon": -73.7781 },
+  "current": {
+    "time": "2026-09-12T14:00",
+    "temp_c": 18.2,
+    "precip_mm": 0.0,
+    "weather_code": 3,
+    "wind_kts": 12.0,
+    "wind_gust_kts": 22.0,
+    "visibility_m": 16000
+  },
+  "hourly": [ { "time": "...", "precip_probability_pct": 40,
+                "wind_gust_kts": 24.0, "visibility_m": 8000 } ],
+  "next_6h": {
+    "max_precip_probability_pct": 80,
+    "max_wind_gust_kts": 28.0,
+    "min_visibility_m": 4000
+  },
+  "note": "Numerical weather model guidance via Open-Meteo..."
+}
+```
+
+There is **no** `flight_category` / VFR / IFR field and there never will
+be. When a TAF covers the same window, the TAF wins. Folded into
+`/api/brief` as `extended_weather` at `SAME_DAY`+ horizons only — not
+on `/api/flight/live`.
 
 ---
 
@@ -1062,3 +1267,11 @@ results[].effective_start / .effective_end
     happened.
 15. **`taxi.applicable` and `position.available` are both false much of the
     time** and the keys are always present. Check the flag, not the key.
+16. **`/api/ops/flow-brief` empty arrays are success.** TFDM is not at
+    JFK/LGA; TBFM/TFMS are US NAS only. A London arrival will have
+    `metering.applicable: false` and that is correct.
+17. **`extended_weather` / `/api/weather/open-meteo` is not a TAF.** No
+    VFR/IFR field is emitted. Do not invent one client-side from visibility
+    metres or weather codes — that would contradict an official TAF.
+18. **`GET /api/ops/atfm` still costs AeroAPI.** The same heuristic is
+    already on `/api/brief` and `/api/flight/live` for free. Prefer those.

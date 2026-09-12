@@ -96,6 +96,7 @@ AIRPORT_COORDS = {
     "PHNL": (21.3187, -157.9225), "PANC": (61.1744, -149.9964),
     # --- European Major ---
     "LIRF": (41.8003, 12.2389),  "LIRN": (40.8860, 14.2908),
+    "LICC": (37.4668, 15.0664),
     "LFPG": (49.0097, 2.5479),  "LFPO": (48.7253, 2.3592),
     "LEMD": (40.4936, -3.5668), "LEBL": (41.2971, 2.0785),
     "EGLL": (51.4700, -0.4543), "EGLC": (51.5053, 0.0553),
@@ -788,6 +789,31 @@ def _to_icao_carrier(flight):
         if flight.startswith(short) and not flight.startswith(full):
             return full + flight[len(short):]
     return flight
+
+
+def infer_atfm_from_status(flight: dict) -> dict:
+    """Run the CTOT heuristic on a flattened status leg (or AeroAPI nested).
+
+    `/api/brief` and `/api/flight/live` already paid for flight status —
+    this adapter lets them contribute ATFM effects without a second AeroAPI
+    query. `cmd_atfm_infer` still hits AeroAPI for the standalone endpoint.
+    """
+    if not isinstance(flight, dict):
+        return {"applicable": False, "reason": "No flight data"}
+    dest = (
+        (flight.get("destination") or {}).get("code_icao")
+        or flight.get("dest_icao")
+        or ""
+    )
+    adapted = {
+        "destination": {"code_icao": dest},
+        "scheduled_out": flight.get("scheduled_out"),
+        "estimated_out": flight.get("estimated_out"),
+        "scheduled_in": flight.get("scheduled_in"),
+        "status": flight.get("status", ""),
+        "origin_flt_cat": flight.get("origin_flt_cat", ""),
+    }
+    return _infer_atfm(adapted)
 
 
 def _infer_atfm(flt):

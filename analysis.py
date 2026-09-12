@@ -253,6 +253,7 @@ SOURCE_HORIZON = {
     "rvr":             (2.0,  "Live runway visual range"),
     "tbfm":            (2.0,  "Live arrival metering"),
     "itws":            (2.0,  "Live terminal weather alerts"),
+    "atfm":            (12.0, "Eurocontrol CTOT heuristic (no extra AeroAPI query)"),
 }
 
 # Reasons a program might cascade past its own expiry, per Branch B.
@@ -358,10 +359,10 @@ def compute_horizon(flight: dict, now: datetime = None,
 PHASE_SUPPRESSED = {
     "PRE_GATE": {"position"},
     "TAXI_OUT": {"equipment_chain"},
-    "AIRBORNE": {"equipment_chain", "rvr", "lightning", "metar"},
+    "AIRBORNE": {"equipment_chain", "rvr", "lightning", "metar", "atfm"},
     "TAXI_IN": {"equipment_chain", "rvr", "lightning", "metar", "taf",
                 "faa_status", "tfms_flow", "sigmet", "isigmet", "gairmet",
-                "tcf", "tbfm", "itws"},
+                "tcf", "tbfm", "itws", "atfm"},
 }
 
 _PHASE_SUPPRESS_REASON = {
@@ -1977,3 +1978,119 @@ def taf_effects(taf: dict, role: str) -> list:
         })
 
     return effects
+
+
+def gairmet_effects(gairmet: dict) -> list:
+    """Turn a G-AIRMET route payload into effects[] when the feed was consulted.
+
+    Quiet `relevant[]` is success — no effect is emitted. SEV/EXTM turbulence
+    is WATCH (ride quality / possible reroute), not ACTION: G-AIRMET is not
+    a ground-delay mechanism by itself.
+    """
+    if not isinstance(gairmet, dict):
+        return []
+    relevant = gairmet.get("relevant")
+    if not isinstance(relevant, list) or not relevant:
+        return []
+
+    effects = []
+    for hit in relevant:
+        if not isinstance(hit, dict):
+            continue
+        haz = (hit.get("hazard") or "").upper()
+        sev = (hit.get("severity") or "").upper()
+        where_bits = []
+        if hit.get("near_origin"):
+            where_bits.append("near origin")
+        if hit.get("near_dest"):
+            where_bits.append("near destination")
+        if hit.get("along_route"):
+            where_bits.append("along the route")
+        where = ", ".join(where_bits) or "along the route"
+
+        severity = "WATCH" if sev in ("SEV", "EXTM") else "INFO"
+        band = ""
+        if hit.get("base_ft") is not None or hit.get("top_ft"):
+            lo = hit.get("base") or "SFC"
+            hi = hit.get("top") or ""
+            band = f" {lo}–{hi}" if hi else f" from {lo}"
+
+        if "LLWS" in haz:
+            effect = (
+                f"Low-level wind shear G-AIRMET {where}. Shear commonly "
+                "triggers runway changes and extra spacing; it is not "
+                "itself a ground stop."
+            )
+        elif "TURB" in haz:
+            effect = (
+                f"Forecast {sev or 'unspecified'} turbulence {where}{band}. "
+                "Expect a rougher ride"
+                + (" and a realistic chance of a reroute" if sev in ("SEV", "EXTM")
+                   else "")
+                + ". Not a gate-hold mechanism by itself."
+            )
+        elif "ICE" in haz:
+            effect = (
+                f"Forecast icing {where}{band}. Crews may request altitude "
+                "changes; rarely a departure-delay driver."
+            )
+        else:
+            effect = f"G-AIRMET {haz or 'advisory'} {where}."
+
+        effects.append({
+            "cause": f"G-AIRMET {haz or 'advisory'}"
+                     + (f" ({sev})" if sev else "")
+                     + f" {where}",
+            "effect": effect,
+            "severity": severity,
+            "source": "gairmet",
+        })
+    return effects
+
+
+def atfm_effects(atfm: dict) -> list:
+    """Turn the Eurocontrol CTOT heuristic into effects[].
+
+    NO_INDICATION / not applicable emit nothing so a US-domestic brief
+    does not grow a decorative European-airspace row.
+    """
+    if not isinstance(atfm, dict) or not atfm.get("applicable"):
+        return []
+    verdict = (atfm.get("verdict") or "NO_INDICATION").upper()
+    if verdict == "NO_INDICATION":
+        return []
+
+    dest = atfm.get("destination") or "the destination"
+    delay = atfm.get("delay_min") or 0
+    conf = atfm.get("confidence_pct")
+    gap = f", {int(delay)} min sched-to-est gap" if delay else ""
+    conf_bit = f"{conf}% confidence" if conf is not None else "heuristic"
+
+    if verdict == "PROBABLE":
+        severity = "WATCH"
+        effect = (
+            "Delay pattern is consistent with a Eurocontrol CTOT "
+            "(calculated take-off time) slot. The airline estimate is "
+            "likely the regulated time, not a local weather hold. This "
+            "is a heuristic — not a published slot from NM B2B."
+        )
+    elif verdict == "POSSIBLE":
+        severity = "WATCH"
+        effect = (
+            "Some indicators of Eurocontrol ATFM regulation. Re-check "
+            "closer to departure; this is a heuristic, not a published CTOT."
+        )
+    else:
+        severity = "INFO"
+        effect = (
+            "European destination, but ATFM/CTOT indicators are weak. "
+            "No strong evidence of a slot delay."
+        )
+
+    return [{
+        "cause": f"Eurocontrol ATFM heuristic at {dest}: {verdict} "
+                 f"({conf_bit}{gap})",
+        "effect": effect,
+        "severity": severity,
+        "source": "atfm",
+    }]
