@@ -180,7 +180,7 @@ def _local_date_of(iso_ts: str, tz_name: str) -> str | None:
     return dt.strftime("%Y-%m-%d")
 
 
-def _prefetched_flights(flight_ident, raw=None):
+def _prefetched_flights(flight_ident, raw=None, date=None):
     """Reuse a flight status the caller already paid for.
 
     /api/check runs `status` and then `chain` for the same flight, and both
@@ -200,8 +200,13 @@ def _prefetched_flights(flight_ident, raw=None):
         return None
     if not isinstance(payload, dict):
         return None
-    # Only reuse it for the flight it actually describes.
+    # Only reuse it for the flight (and date, when both sides have one) it
+    # actually describes. A same-ident different-date payload would otherwise
+    # skip the live call and hand chain the wrong day's legs.
     if (payload.get("flight") or "").upper() != (flight_ident or "").upper():
+        return None
+    payload_date = payload.get("date")
+    if date and payload_date and str(payload_date) != str(date):
         return None
     flights = (payload.get("data") or {}).get("flights")
     if not flights or not isinstance(flights, list):
@@ -210,7 +215,7 @@ def _prefetched_flights(flight_ident, raw=None):
 
 
 def aeroapi_flight_status(flight_ident, date=None, prefetched_raw=None):
-    prefetched = _prefetched_flights(flight_ident, raw=prefetched_raw)
+    prefetched = _prefetched_flights(flight_ident, raw=prefetched_raw, date=date)
     if prefetched is not None:
         return prefetched, None
 

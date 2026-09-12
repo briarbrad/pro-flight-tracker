@@ -55,7 +55,10 @@ In Railway dashboard → your service → **Variables** tab, add these:
 |---|---|---|
 | `ADSB_EXCHANGE_KEY` | ADS-B Exchange RapidAPI key | [rapidapi.com/adsbexchange](https://rapidapi.com/adsbexchange/api/adsbexchange-com1) — Free tier available |
 | `OPENSKY_API_KEY` | OpenSky Network credentials | [opensky-network.org](https://opensky-network.org/) — Free account, format: `username:password` |
-| `WEATHER_USER_AGENT` | User-Agent for weather APIs | Any string, e.g. `ProFlightTracker/1.3 (your@email.com)` |
+| `WEATHER_USER_AGENT` | User-Agent for weather APIs | Any string, e.g. `ProFlightTracker/1.10 (your@email.com)` |
+| `API_TOKEN` / `REQUIRE_AUTH` | Optional bearer auth | Dormant until `REQUIRE_AUTH=1`. See README. |
+| `RATE_LIMIT_PER_MIN` | Per-worker request cap | Default `60`, always on |
+| `DATABASE_URL` | Postgres (tracking + SWIM daemon) | Injected automatically when you add Railway Postgres. `postgres://` is rewritten to `postgresql://` |
 
 ### Pre-Set (Already in Config)
 
@@ -84,8 +87,13 @@ Expected response:
 {
   "status": "ok",
   "service": "pro-flight-tracker",
-  "version": "1.5",
-  "timestamp": "2026-08-16T15:30:00Z"
+  "version": "1.10",
+  "timestamp": "2026-09-12T15:30:00Z",
+  "store": {"backend": "postgres", "ok": true},
+  "tracker_leader": true,
+  "cache_entries": 0,
+  "breakers": {},
+  "swim_daemon": {}
 }
 ```
 
@@ -200,28 +208,29 @@ Account: **AeroAPI Personal** — $5 free usage credit/month, **10 result sets
 per minute** rate limit. FlightAware does not publish per-query rates on a
 static page; check the usage page in your AeroAPI console for actual spend.
 
-**Actual query count per `/api/check` — 4 to 5, not 2-3:**
+**Actual query count per `/api/check` — 2 to 3:**
 
 | Phase | Script | AeroAPI endpoints hit | Calls |
 |---|---|---|---|
-| 1 | `flight_data.py status` | `/flights/{ident}`, `/flights/{id}/route` | 2 |
-| 2 | `flight_data.py chain` | `/flights/{ident}`, `/flights/{inbound_id}` | 2 |
+| 1 | `flight_data.py status` | `/flights/{ident}` (route is opt-in, not bought) | 1 |
+| 2 | `flight_data.py chain` | `/flights/{inbound_id}` (status is prefetched) | 1 |
 | 2 | `flight_data.py chain` | `/flights/{id}/position` (only if ADS-B failed) | 0-1 |
 
-One of those is wasted: `cmd_chain` re-fetches the same `/flights/{ident}`
-that Phase 1 already retrieved. Passing the Phase 1 result through would cut
-roughly 20% off the cost of every check.
+Phase 1's status payload is passed through `PFT_PREFETCHED_STATUS` so
+`cmd_chain` does not re-buy `/flights/{ident}`. The background tracker
+does the same when it runs an equipment-chain lookup.
 
-**Rate limit headroom:** a single check at 4-5 calls is comfortably under
-10/minute. Two concurrent checks are not — expect 429s if the app fans out.
+**Rate limit headroom:** a single check at 2-3 calls is comfortably under
+10/minute. Two concurrent checks plus a tracker cycle can still 429.
 
-**Background tracker budget:** at the 15-minute default, a quick check costs
-2 AeroAPI calls, so 4 checks/hour = 192 calls/day *per tracked flight*.
-Against a $5 monthly credit, one continuously tracked flight exhausts the
-credit in days, not weeks. Raise `interval_minutes`, and note there is
-currently **no expiry** — a tracked flight keeps polling after it lands.
-
-> **The background tracker does not currently run in production.** See below.
+**Background tracker budget:** cadence is phase/horizon-aware (5–360
+minutes), not stuck at the 15-minute create-time default. A distant
+scheduled flight polls roughly hourly-to-6-hourly; a taxiing one every 5
+minutes. A typical status-only pass is **1** AeroAPI call; an
+equipment-chain pass adds 1 more (inbound) when the cache is cold. Flights
+are dropped when AeroAPI reports cancelled/diverted/arrived, and
+unconditionally after 36 hours (`DEFAULT_TTL_HOURS`). Set
+`DISABLE_TRACKER=1` to stop spend immediately without a redeploy.
 
 ### SWIM feeds return empty results
 - `total_raw_messages: 0` with no `error` field means the connection worked

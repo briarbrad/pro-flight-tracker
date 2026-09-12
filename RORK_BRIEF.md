@@ -20,8 +20,8 @@ edges are.
 | | |
 |---|---|
 | **Base URL** | `https://pro-flight-tracker-production.up.railway.app` |
-| **Auth** | None. No API key, no accounts, no session. Single-user personal app. |
-| **CORS** | Wide open (`flask-cors` with default config) — any origin may call it. |
+| **Auth** | Dormant by default. Send `Authorization: Bearer <token>` matching `API_TOKEN` when set. Enforced only if `REQUIRE_AUTH=1` (otherwise unauthenticated requests are logged and still served). `/health` and CORS preflights are always exempt. A per-worker rate cap (`RATE_LIMIT_PER_MIN`, default 60) is always on and returns `429`. |
+| **CORS** | Allowlist via `ALLOWED_ORIGINS` (comma-separated). Empty default = no browser origin. Native iOS is unaffected (no `Origin` header). |
 | **Content type** | Everything returns JSON. |
 | **Methods** | `GET` for reads; `POST`/`DELETE` only on `/api/track`; `/api/check` accepts both `GET` and `POST`. |
 
@@ -29,7 +29,7 @@ Health check, useful as a connectivity probe:
 
 ```
 GET /health
-→ {"service":"pro-flight-tracker","status":"ok","version":"1.8","timestamp":"...",
+→ {"service":"pro-flight-tracker","status":"ok","version":"1.10","timestamp":"...",
    "store":{...},"tracker_leader":true,"cache_entries":N,"breakers":{...},"swim_daemon":{...}}
 ```
 
@@ -95,9 +95,10 @@ top level.
 ```
 
 `total_raw_messages` is how many messages came off the broker; `filtered_results`
-is how many survived the airport/flight filter. **`filtered_results` caps at 50**
-— that's a hardcoded `--limit` default in the script with no query parameter
-wired up to override it, so a value of exactly 50 means "at least 50," not 50.
+is how many survived the airport/flight filter. **`filtered_results` defaults
+to 50.** Pass `limit=` (integer, clamped 1–200) to raise or lower it. A value
+equal to the limit you sent (or 50 if you sent none) means "at least that
+many," not an exact count.
 
 ### Envelope D — ops endpoints (`/api/ops/*`)
 
@@ -133,8 +134,8 @@ empirically before relying on it.
 
 | Endpoint | Query params | Notes |
 |---|---|---|
-| `GET /api/flight/status` | `flight` (req), `date` | 2 AeroAPI queries (status + route) |
-| `GET /api/flight/chain` | `flight` (req), `date` | 2–3 AeroAPI queries. Inbound aircraft + turn time |
+| `GET /api/flight/status` | `flight` (req), `date` | 1 AeroAPI query (filed route is opt-in and this endpoint does not buy it) |
+| `GET /api/flight/chain` | `flight` (req), `date` | 1–2 AeroAPI queries (inbound + optional position). Status is fetched here only when this endpoint is called standalone |
 | `GET /api/flight/track` | `reg` or `flight` | Tries ADS-B/OpenSky first (free), falls back to AeroAPI |
 
 ### Weather — free, fast
@@ -188,8 +189,11 @@ of JVM startup and handshake.
 
 Parameter handling notes that apply to all SWIM endpoints:
 
-- `duration` is coerced to an integer and **clamped to 1–30**. Garbage falls
-  back to the endpoint default rather than erroring.
+- `duration` is coerced to an integer and **clamped to 1–20**. Garbage falls
+  back to the endpoint default rather than erroring. (The subprocess timeout
+  is 45s; JVM startup + TLS + JMS teardown eat ~10–15s outside `--duration`,
+  so a user-supplied `duration=30` used to 504.)
+- `limit` is coerced to an integer and **clamped to 1–200** (default 50).
 - `airport` / `flight` / `keyword` are uppercased and stripped of stray quotes.
   Non-alphanumeric values are discarded. A value starting with `-` is rejected.
 - Endpoints marked **req** return `400` with a `hint` field if `airport` is
@@ -731,23 +735,27 @@ deterministic ones, even if the narrative call is slow or fails.
 
 - **$5 of free usage credit per month.** Credits do not roll over.
 - **10 result sets per minute** rate limit.
-- Only `/api/flight/*` and `/api/check` touch AeroAPI. Everything else —
-  weather, ops, all SWIM feeds — is free.
+- Only `/api/flight/*`, `/api/brief`, `/api/check`, and the background
+  tracker touch AeroAPI. Everything else — weather, ops, all SWIM feeds —
+  is free.
 
 Query cost per call:
 
 | Call | AeroAPI queries |
 |---|---|
-| `/api/flight/status` | 2 |
-| `/api/flight/chain` | 2–3 |
+| `/api/flight/status` | 1 |
+| `/api/flight/chain` | 1–2 (inbound + optional position fallback) |
 | `/api/flight/track` | 0–1 (only if ADS-B and OpenSky both miss) |
-| `/api/check` | 3–4 total |
-| Background tracker, per interval per flight | 2 |
+| `/api/flight/live` | 1 |
+| `/api/brief` | 1–3 (status + inbound if equipment-chain is relevant + optional position) |
+| `/api/check` | 2–3 total (status is reused by chain) |
+| Background tracker, per interval per flight | 1 typical; +1 inbound when a cold equipment-chain lookup runs |
 
 Practical implications for anything you build:
 
-- **Do not poll `/api/check` on a timer.** At 3–4 queries a call, a 30-second
+- **Do not poll `/api/check` on a timer.** At 2–3 queries a call, a 30-second
   refresh loop would exhaust a month of credit in well under an hour.
+  Use `/api/flight/live` (1 query) for the main refresh.
 - **Do not fire concurrent flight lookups.** Two simultaneous `/api/check` calls
   can breach 10 queries/minute and start returning 429s.
 - Weather and SWIM are free — refresh those as often as is useful without
@@ -865,7 +873,9 @@ stays silent. Payload:
 |---|---|---|
 | `200` | Success — **may still contain per-source `error` keys** | varies |
 | `400` | Missing/invalid required parameter | `{"error": "...", "hint": "..."}` |
+| `401` | `REQUIRE_AUTH=1` and bearer token missing/wrong | `{"error": "Unauthorized", "hint": "..."}` |
 | `404` | `DELETE /api/track` on an untracked flight | `{"error": "Not tracking this flight"}` |
+| `429` | Per-worker rate cap exceeded | `{"error": "Rate limit exceeded", "limit_per_minute": N, "retry_after_seconds": N}` |
 | `500` | Script failed | `{"error": "...", "detail": "...", "returncode": N}` |
 | `504` | Script exceeded its timeout | `{"error": "Script timed out after Ns"}` |
 

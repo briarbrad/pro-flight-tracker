@@ -21,7 +21,20 @@ import os
 import threading
 from datetime import datetime, timezone, timedelta
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+def _normalize_database_url(url: str) -> str:
+    """Accept the postgres:// scheme some hosts still inject.
+
+    Railway and older Heroku-style addons emit `postgres://...`. psycopg3
+    usually accepts it, but connection poolers and SSL query-string handling
+    have historically been pickier about `postgresql://`. Normalize once so
+    a default Railway URL can't silently fall back to the in-memory store.
+    """
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+DATABASE_URL = _normalize_database_url(os.environ.get("DATABASE_URL", "").strip())
 
 # Postgres advisory lock key for tracker leadership. Arbitrary but must be
 # stable across workers.
@@ -688,8 +701,9 @@ def get_cached_edct(flight: str, date: str) -> dict | None:
 # Turn-time / equipment-chain caching
 #
 # The equipment_chain lookup (inbound aircraft + turn-time math) is the
-# single most predictive signal the app computes, but it costs 2 AeroAPI
-# queries and only ever ran from /api/brief on a manual tap. That meant:
+# single most predictive signal the app computes, but it costs a paid
+# inbound AeroAPI query (status is prefetched when the caller already has
+# it) and only ever ran from /api/brief on a manual tap. That meant:
 # the cheap /api/flight/live tile could show a live delay while its own
 # "no single cause was identified" note was true only because /live never
 # looked. Same fix shape as EDCT caching above: the brief caches what it
