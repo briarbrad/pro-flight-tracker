@@ -34,6 +34,9 @@ AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"
 ADSB_EXCHANGE_HOST = "adsbexchange-com1.p.rapidapi.com"
 ADSB_EXCHANGE_BASE = f"https://{ADSB_EXCHANGE_HOST}"
 OPENSKY_BASE = "https://opensky-network.org/api"
+OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+
+HTTP_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) FlightTracker/1.3"
 
 REQUEST_TIMEOUT = 10
 RETRY_BACKOFF = 1
@@ -135,10 +138,89 @@ def _get_adsb_key():
     return os.environ.get("ADSB_EXCHANGE_KEY", "").strip() or None
 
 def _get_opensky_creds():
+    """Returns (mode, id_or_user, secret_or_pw).
+
+    OPENSKY_API_KEY accepts two formats:
+      - JSON {"clientId": "...", "clientSecret": "..."} → OAuth2 (current;
+        OpenSky retired basic auth)
+      - legacy "username:password" → HTTP Basic (kept as fallback)
+    """
     raw = os.environ.get("OPENSKY_API_KEY", "").strip()
-    if not raw or ":" not in raw: return None, None
-    parts = raw.split(":", 1)
-    return parts[0], parts[1]
+    if not raw:
+        return None, None, None
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            cid = d.get("clientId") or d.get("client_id")
+            sec = d.get("clientSecret") or d.get("client_secret")
+            if cid and sec:
+                return "oauth", cid, sec
+        except (ValueError, AttributeError):
+            pass
+        return None, None, None
+    if ":" in raw:
+        user, pw = raw.split(":", 1)
+        return "basic", user, pw
+    return None, None, None
+
+_opensky_token = {"access_token": None, "expires_at": 0.0}
+
+def _opensky_token_cache_path():
+    try:
+        d = os.path.expanduser("~/.config/pro-flight-tracker")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        return os.path.join(d, "opensky_token.json")
+    except OSError:
+        return None
+
+def _get_opensky_token():
+    """Mint (and cache ~30 min) an OpenSky OAuth2 bearer token."""
+    mode, cid, sec = _get_opensky_creds()
+    if mode != "oauth":
+        return None
+    now = time.time()
+    if _opensky_token["access_token"] and _opensky_token["expires_at"] > now + 60:
+        return _opensky_token["access_token"]
+    p = _opensky_token_cache_path()
+    if p:
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            if d.get("access_token") and d.get("expires_at", 0) > now + 60:
+                _opensky_token.update(access_token=d["access_token"],
+                                              expires_at=d["expires_at"])
+                return d["access_token"]
+        except (OSError, ValueError):
+            pass
+    try:
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": sec,
+        }).encode()
+        req = urllib.request.Request(
+            OPENSKY_TOKEN_URL, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": HTTP_USER_AGENT},  # auth server drops UA-less POSTs
+            method="POST")
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        tok = data.get("access_token")
+        if not tok:
+            return None
+        exp = now + int(data.get("expires_in", 1800)) - 120  # safety margin
+        _opensky_token.update(access_token=tok, expires_at=exp)
+        if p:
+            try:
+                with open(p, "w") as f:
+                    json.dump({"access_token": tok, "expires_at": exp}, f)
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+        return tok
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # AeroAPI v4
@@ -188,16 +270,20 @@ def _prefetched_flights(flight_ident, raw=None, date=None):
     caller can now pass its Phase 1 result through PFT_PREFETCHED_STATUS
     (JSON, same shape cmd_status returns) and we skip the duplicate call.
 
-    Returns None when there's nothing usable, so callers fall through to the
-    live API.
+    `raw` may be the dict itself (in-process path) or its JSON (subprocess
+    env path). Returns None when there's nothing usable, so callers fall
+    through to the live API.
     """
-    raw = raw if raw is not None else os.environ.get("PFT_PREFETCHED_STATUS", "")
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        raw = raw if raw is not None else os.environ.get("PFT_PREFETCHED_STATUS", "")
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
     if not isinstance(payload, dict):
         return None
     # Only reuse it for the flight (and date, when both sides have one) it
@@ -376,8 +462,12 @@ def _parse_adsb_aircraft(ac):
 # OpenSky Network
 # ---------------------------------------------------------------------------
 def opensky_headers():
-    user, pw = _get_opensky_creds()
-    if user and pw:
+    mode, user, pw = _get_opensky_creds()
+    if mode == "oauth":
+        tok = _get_opensky_token()
+        if tok:
+            return {"Authorization": f"Bearer {tok}", "Accept": "application/json"}
+    elif mode == "basic" and user and pw:
         cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
         return {"Authorization": f"Basic {cred}", "Accept": "application/json"}
     return {"Accept": "application/json"}
